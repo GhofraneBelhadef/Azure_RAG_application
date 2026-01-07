@@ -30,46 +30,7 @@ A full-stack **Retrieval-Augmented Generation (RAG) Chatbot** that enables users
 - **Complete user management** (create, delete, reset passwords, set limits)
 - **Document moderation** (upload documents for users, manage public/private status)
 - **System monitoring** (usage analytics, budget tracking, health checks)
-- **Vector database management** (ingest, remove, clear operations
-┌─────────────┐ ┌─────────────┐ ┌─────────────┐
-│ Streamlit │ │ FastAPI │ │ PostgreSQL │
-│ Frontend │◄──►│ Backend │◄──►│ (Azure) │
-│ (Port 8501)│ │ (Port 8000)│ │ + pgvector │
-└─────────────┘ └─────────────┘ └─────────────┘
-│
-┌─────────────┐ ┌─────────────┐ │
-│ Admin CLI │ │ Azure Blob │◄────────────┘
-│ Interface │ │ Storage │
-└─────────────┘ └─────────────┘
-│
-▼
-┌─────────────┐
-│ Azure OpenAI│
-│ Embeddings │
-│ & GPT-4 │
-└─────────────┘
-
-## Project Structure
-azure-rag-chatbot/
-├── backend/ # FastAPI Backend
-│ ├── auth.py # Authentication & user management
-│ ├── pdf_processor_simple.py # PDF processing & embeddings
-│ ├── rag_engine.py # RAG chat engine
-│ ├── blob_storage.py # Azure Blob Storage operations
-│ ├── shared_dependencies.py # Shared AI clients & budget tracker
-│ ├── database.py # PostgreSQL connection
-│ ├── main.py # FastAPI app entry point
-│ ├── cli_interface.py # Admin CLI tool
-│ ├── requirements.txt # Python dependencies
-│ └── Dockerfile # Container configuration
-├── frontend/ # Streamlit Frontend
-│ ├── app_simple.py # Web interface
-│ ├── requirements.txt # Frontend dependencies
-│ └── Dockerfile # Container configuration
-├── docker-compose.yml # Local development
-├── docker-compose.prod.yml # Production configuration
-├── deploy-azure.ps1 # Azure deployment script
-└── .env.example # Environment variables template
+- **Vector database management** (ingest, remove, clear operations)
 
 ## Tech Stack
 
@@ -85,5 +46,3 @@ azure-rag-chatbot/
 | **Authentication** | bcrypt + UUID | Secure password hashing & user management |
 | **Deployment** | Docker + Azure App Service | Containerized cloud deployment |
 | **Document Processing** | LangChain | PDF/text extraction and chunking |
-
-## Architecture
