@@ -22,7 +22,7 @@ python-dotenv==1.0.0
 fastapi-cors==0.1.0
 
 # MINIMAL LangChain components ONLY
-langchain-core==0.1.0
+langchain-core
 langchain-community==0.0.10
 langchain-text-splitters==0.0.1
 
