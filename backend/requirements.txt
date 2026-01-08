@@ -31,3 +31,4 @@ pydantic
 pydantic-settings
 
 bcrypt
+pypdf
