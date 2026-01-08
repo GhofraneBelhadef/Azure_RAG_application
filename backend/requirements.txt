@@ -29,3 +29,5 @@ langchain-text-splitters
 # Pydantic
 pydantic
 pydantic-settings
+
+bcrypt
