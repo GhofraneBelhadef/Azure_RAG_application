@@ -1,33 +1,41 @@
 # Core FastAPI
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-python-multipart==0.0.6
+fastapi
+uvicorn[standard]
+python-multipart
 
 # Database
-psycopg2-binary==2.9.9
+psycopg2-binary
 
 # Azure OpenAI
-openai==1.3.5
+openai
 
 # PDF Processing (minimal)
-PyPDF2==3.0.1
+PyPDF2
 
 # Azure Storage
-azure-storage-blob==12.19.0
+azure-storage-blob
 
 # Environment
-python-dotenv==1.0.0
+python-dotenv
 
 # CORS
-fastapi-cors==0.1.0
+fastapi-cors
 
 # MINIMAL LangChain components ONLY
-langchain-core==0.1.0
-langchain-community==0.0.10
-langchain-text-splitters==0.0.1
+langchain-core
+langchain-community
+langchain-text-splitters
 
 # Pydantic
+<<<<<<< HEAD
 pydantic==2.5.0
 pydantic-settings==2.1.0
 
 locust
+=======
+pydantic
+pydantic-settings
+
+bcrypt
+pypdf
+>>>>>>> 036c1403bf43a6fbd62129de15a9bbf6877506da
