@@ -1,12 +1,11 @@
-# frontend/app_simple.py - Updated for admin-controlled registration, document limits, and chunk display (FIXED DUPLICATE REQUEST)
+# frontend/app_simple.py - Complete with JWT Authentication
 import streamlit as st
 import requests
 import json
 import time
-import io
-from datetime import datetime
 import os
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
 
 load_dotenv()
 
@@ -39,40 +38,127 @@ def init_session_state():
         st.session_state.processing_question = None
     if 'last_processed_question' not in st.session_state:
         st.session_state.last_processed_question = None
+    if 'access_token' not in st.session_state:
+        st.session_state.access_token = None
+    if 'refresh_token' not in st.session_state:
+        st.session_state.refresh_token = None
+    if 'token_expiry' not in st.session_state:
+        st.session_state.token_expiry = None
 
 init_session_state()
 
-# API Helper
-def api_call(endpoint, method="GET", data=None, files=None):
+# API Helper with token management
+def api_call(endpoint, method="GET", data=None, files=None, require_auth=True):
+    """Make API call with automatic token refresh"""
     try:
         url = f"{BACKEND_URL}{endpoint}"
         
+        # Prepare headers
+        headers = {}
+        
+        # Add authorization header if required
+        if require_auth and st.session_state.access_token:
+            headers["Authorization"] = f"Bearer {st.session_state.access_token}"
+        
+        # Check token expiry and refresh if needed
+        if require_auth and st.session_state.token_expiry:
+            try:
+                expiry_time = datetime.fromisoformat(st.session_state.token_expiry)
+                if datetime.now() > expiry_time - timedelta(minutes=5):  # Refresh 5 minutes before expiry
+                    refresh_response = refresh_token_call()
+                    if refresh_response and not refresh_response.get("error"):
+                        st.session_state.access_token = refresh_response.get("access_token")
+                        headers["Authorization"] = f"Bearer {st.session_state.access_token}"
+                        # Set new expiry (25 minutes from now for 30-minute tokens)
+                        st.session_state.token_expiry = (datetime.now() + timedelta(minutes=25)).isoformat()
+            except:
+                pass
+        
+        # Make the request
         if method == "GET":
-            response = requests.get(url)
+            response = requests.get(url, headers=headers)
         elif method == "POST" and files:
-            response = requests.post(url, files=files, data=data)
+            response = requests.post(url, files=files, data=data, headers=headers)
         elif method == "POST":
-            headers = {"Content-Type": "application/json"}
+            if "Content-Type" not in headers:
+                headers["Content-Type"] = "application/json"
             response = requests.post(url, json=data, headers=headers)
         elif method == "DELETE":
-            response = requests.delete(url)
+            response = requests.delete(url, headers=headers)
         else:
             return None
         
+        # Handle response
         if response.status_code == 200:
             return response.json()
-        else:
-            # Return the full response for error handling
-            return {
-                "status_code": response.status_code,
-                "error": True,
-                "detail": response.json() if response.text else {"detail": f"HTTP {response.status_code}"}
-            }
+        elif response.status_code == 401 and require_auth:
+            # Token might be expired, try to refresh
+            refresh_response = refresh_token_call()
+            if refresh_response and not refresh_response.get("error"):
+                # Retry the request with new token
+                st.session_state.access_token = refresh_response.get("access_token")
+                headers["Authorization"] = f"Bearer {st.session_state.access_token}"
+                
+                if method == "GET":
+                    response = requests.get(url, headers=headers)
+                elif method == "POST" and files:
+                    response = requests.post(url, files=files, data=data, headers=headers)
+                elif method == "POST":
+                    response = requests.post(url, json=data, headers=headers)
+                elif method == "DELETE":
+                    response = requests.delete(url, headers=headers)
+                
+                if response.status_code == 200:
+                    return response.json()
+        
+        # Return error response
+        error_detail = {"detail": f"HTTP {response.status_code}"}
+        try:
+            if response.text:
+                error_detail = response.json()
+        except:
+            pass
+            
+        return {
+            "status_code": response.status_code,
+            "error": True,
+            "detail": error_detail
+        }
     except Exception as e:
         return {
             "status_code": 0,
             "error": True,
             "detail": {"detail": f"Connection error: {str(e)}"}
+        }
+
+def refresh_token_call():
+    """Refresh access token using refresh token"""
+    if not st.session_state.refresh_token:
+        return None
+    
+    try:
+        url = f"{BACKEND_URL}/auth/refresh"
+        data = {"refresh_token": st.session_state.refresh_token}
+        headers = {"Content-Type": "application/json"}
+        
+        response = requests.post(url, json=data, headers=headers)
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            # Refresh token expired, force logout
+            st.session_state.logged_in = False
+            st.session_state.access_token = None
+            st.session_state.refresh_token = None
+            st.session_state.token_expiry = None
+            return {
+                "error": True,
+                "detail": {"detail": "Session expired. Please login again."}
+            }
+    except Exception as e:
+        return {
+            "error": True,
+            "detail": {"detail": f"Refresh failed: {str(e)}"}
         }
 
 # Login Page
@@ -99,16 +185,19 @@ def login_page():
             
             if submit and username and password:
                 data = {"username": username, "password": password}
-                response = api_call("/auth/login", method="POST", data=data)
+                response = api_call("/auth/login", method="POST", data=data, require_auth=False)
                 
                 if response and not response.get("error"):
                     st.session_state.logged_in = True
                     st.session_state.user_id = response.get("user_id")
                     st.session_state.username = username
                     st.session_state.is_admin = response.get("is_admin", False)
+                    st.session_state.access_token = response.get("access_token")
+                    st.session_state.refresh_token = response.get("refresh_token")
+                    st.session_state.token_expiry = (datetime.now() + timedelta(minutes=25)).isoformat()
                     
                     # Get user's document limit
-                    reg_response = api_call(f"/auth/check-registration/{username}")
+                    reg_response = api_call(f"/auth/check-registration/{username}", require_auth=False)
                     if reg_response and not reg_response.get("error"):
                         st.session_state.user_max_documents = reg_response.get("max_documents", 5)
                     
@@ -116,7 +205,8 @@ def login_page():
                     time.sleep(1)
                     st.rerun()
                 elif response and response.get("error"):
-                    st.error(f"Login failed: {response.get('detail', {}).get('detail', 'Unknown error')}")
+                    error_msg = response.get('detail', {}).get('detail', 'Unknown error')
+                    st.error(f"Login failed: {error_msg}")
     
     with tab2:
         st.subheader("Complete Registration")
@@ -141,7 +231,7 @@ def login_page():
                         "registration_password": temp_password,
                         "new_password": new_password
                     }
-                    response = api_call("/auth/complete-registration", method="POST", data=data)
+                    response = api_call("/auth/complete-registration", method="POST", data=data, require_auth=False)
                     
                     if response:
                         if response.get("error"):
@@ -170,7 +260,7 @@ def login_page():
                     else:
                         st.error("Registration failed. Please check your temporary password.")
 
-# Chat Interface with Chunk Display (FIXED DUPLICATE REQUEST)
+# Chat Interface with Chunk Display
 def chat_page():
     st.title("💬 Chat with Your Documents")
     
@@ -195,7 +285,7 @@ def chat_page():
         
         # Show PDF count
         if st.session_state.user_id:
-            response = api_call(f"/pdf/user/{st.session_state.user_id}/count")
+            response = api_call("/pdf/user/count", require_auth=True)
             if response and not response.get("error"):
                 count = response.get("pdf_count", 0)
                 max_allowed = response.get("max_allowed", 5)
@@ -216,11 +306,14 @@ def chat_page():
             st.session_state.user_max_documents = 5
             st.session_state.processing_question = None
             st.session_state.last_processed_question = None
+            st.session_state.access_token = None
+            st.session_state.refresh_token = None
+            st.session_state.token_expiry = None
             st.rerun()
         
         # Health check
         if st.button("Check System Health"):
-            health = api_call("/health")
+            health = api_call("/health", require_auth=False)
             if health and not health.get("error"):
                 st.success("✅ System is healthy")
                 st.json(health)
@@ -324,7 +417,7 @@ def chat_page():
                                 else:
                                     st.info("No detailed chunk information available for this response.")
     
-    # Chat input - FIXED to prevent duplicate requests
+    # Chat input
     chat_input_container = st.container()
     
     with chat_input_container:
@@ -359,11 +452,10 @@ def chat_page():
                 with st.chat_message("assistant"):
                     with st.spinner("Thinking..."):
                         data = {
-                            "user_id": st.session_state.user_id,
                             "question": question,
                             "use_public_data": use_public_data
                         }
-                        response = api_call("/chat/ask", method="POST", data=data)
+                        response = api_call("/chat/ask", method="POST", data=data, require_auth=True)
                         
                         if response and not response.get("error"):
                             answer = response.get("answer", "No response")
@@ -393,7 +485,7 @@ def chat_page():
                             # Clear the last processed question if there was an error
                             st.session_state.last_processed_question = None
 
-# Documents Page with working delete button
+# Documents Page
 def documents_page():
     st.title("📁 My Documents")
     
@@ -405,7 +497,7 @@ def documents_page():
     
     with col1:
         # Show PDF count with user's limit
-        response = api_call(f"/pdf/user/{st.session_state.user_id}/count")
+        response = api_call("/pdf/user/count", require_auth=True)
         if response and not response.get("error"):
             count = response.get("pdf_count", 0)
             max_allowed = response.get("max_allowed", 5)
@@ -422,7 +514,7 @@ def documents_page():
                 st.caption(f"Your document limit: {user_max_docs}")
         
         # List documents
-        response = api_call(f"/pdf/user/{st.session_state.user_id}/documents")
+        response = api_call("/pdf/user/documents", require_auth=True)
         
         if response and not response.get("error"):
             documents = response.get("documents", [])
@@ -440,7 +532,7 @@ def documents_page():
                         col_a, col_b = st.columns(2)
                         with col_a:
                             if st.button("📥 Download", key=f"dl_{doc['document_id']}"):
-                                download_response = api_call(f"/pdf/download/{doc['document_id']}")
+                                download_response = api_call(f"/pdf/download/{doc['document_id']}", require_auth=True)
                                 if download_response and not download_response.get("error"):
                                     st.success(f"Download initiated for {doc['filename']}")
                                     st.info("In a production app, this would trigger a file download")
@@ -452,7 +544,7 @@ def documents_page():
                                 with confirm_col1:
                                     if st.button(f"🗑️ Yes, Delete", key=f"confirm_del_{doc['document_id']}"):
                                         with st.spinner(f"Deleting {doc['filename']}..."):
-                                            result = api_call(f"/pdf/delete/{doc['document_id']}", method="DELETE")
+                                            result = api_call(f"/pdf/delete/{doc['document_id']}", method="DELETE", require_auth=True)
                                             if result and not result.get("error"):
                                                 st.success(f"✅ Deleted '{doc['filename']}'!")
                                                 st.session_state.confirm_delete = None
@@ -474,7 +566,7 @@ def documents_page():
         st.subheader("Upload PDF")
         
         # Check if can upload more
-        can_upload_response = api_call(f"/pdf/user/{st.session_state.user_id}/count")
+        can_upload_response = api_call("/pdf/user/count", require_auth=True)
         can_upload = True
         max_allowed = "unlimited"
         
@@ -508,10 +600,11 @@ def documents_page():
                         }
                         
                         response = api_call(
-                            f"/pdf/upload/{st.session_state.user_id}",
+                            "/pdf/upload",
                             method="POST",
                             files=files,
-                            data=data
+                            data=data,
+                            require_auth=True
                         )
                         
                         if response and not response.get("error"):
@@ -538,7 +631,7 @@ def admin_page():
         
         with col1:
             if st.button("👥 List All Users", key="list_users_btn"):
-                response = api_call("/auth/admin/users")
+                response = api_call("/auth/admin/users", require_auth=True)
                 if response and not response.get("error"):
                     users = response.get("users", [])
                     
@@ -602,7 +695,7 @@ def admin_page():
                             "is_admin": is_admin,
                             "max_documents": max_documents
                         }
-                        response = api_call("/auth/admin/create-user", method="POST", data=data)
+                        response = api_call("/auth/admin/create-user", method="POST", data=data, require_auth=True)
                         if response and not response.get("error"):
                             st.success(f"✅ User {username} created successfully!")
                             st.info(f"**Temporary Password:** `{temp_password}`")
@@ -629,14 +722,15 @@ def admin_page():
                         files = {"file": (admin_uploaded_file.name, admin_uploaded_file.getvalue(), "application/pdf")}
                         data = {
                             "is_public": str(admin_is_public).lower(),
-                            "admin_upload": "true"  # Always true for admin uploads
+                            "admin_upload": "true"
                         }
                         
                         response = api_call(
-                            f"/pdf/upload/{target_user_id}",
+                            f"/pdf/admin/upload-for-user/{target_user_id}",
                             method="POST",
                             files=files,
-                            data=data
+                            data=data,
+                            require_auth=True
                         )
                         
                         if response and not response.get("error"):
@@ -655,7 +749,7 @@ def admin_page():
                             st.error(f"Upload failed: {response.get('detail', {}).get('detail', 'Unknown error') if response else 'Unknown error'}")
         
         if st.button("📋 List All Documents", key="list_all_docs"):
-            response = api_call("/pdf/admin/all-documents")
+            response = api_call("/pdf/admin/all-documents", require_auth=True)
             if response and not response.get("error"):
                 documents = response.get("documents", [])
                 
@@ -683,7 +777,7 @@ def admin_page():
                     with confirm_col1:
                         if st.button(f"🗑️ Yes, Delete", key="admin_confirm_delete_btn"):
                             with st.spinner(f"Deleting {st.session_state['admin_delete_filename']}..."):
-                                result = api_call(f"/pdf/delete/{st.session_state['admin_confirm_delete']}", method="DELETE")
+                                result = api_call(f"/pdf/delete/{st.session_state['admin_confirm_delete']}", method="DELETE", require_auth=True)
                                 if result and not result.get("error"):
                                     st.success(f"✅ Deleted '{st.session_state['admin_delete_filename']}'!")
                                     del st.session_state['admin_confirm_delete']
@@ -700,13 +794,13 @@ def admin_page():
         st.subheader("System Status")
         
         if st.button("🩺 Check Health", key="health_check"):
-            health = api_call("/health")
+            health = api_call("/health", require_auth=False)
             if health and not health.get("error"):
                 st.success("✅ System is healthy")
                 st.json(health)
         
         st.subheader("💰 Budget Status")
-        budget = api_call("/chat/budget")
+        budget = api_call("/chat/budget", require_auth=True)
         if budget and not budget.get("error"):
             st.json(budget)
         
@@ -715,15 +809,18 @@ def admin_page():
         if st.button("🗑️ Clear All Chat History", key="clear_all_chats"):
             st.warning("This will clear ALL chat history for ALL users!")
             if st.button("⚠️ Confirm Clear All", key="confirm_clear_all"):
-                # Note: This would need a new endpoint in backend
-                st.info("This feature requires a new backend endpoint")
+                response = api_call("/chat/admin/cleanup-all", method="POST", data={"days_old": 0}, require_auth=True)
+                if response and not response.get("error"):
+                    st.success("✅ All chat history cleared!")
+                else:
+                    st.error("Failed to clear chat history")
     
     with tab4:
         st.subheader("📋 Registration Management")
         
         # Show pending registrations
         if st.button("⏳ Show Pending Registrations", key="show_pending"):
-            response = api_call("/auth/admin/pending-registrations")
+            response = api_call("/auth/admin/pending-registrations", require_auth=True)
             if response and not response.get("error"):
                 pending = response.get("pending_registrations", [])
                 count = response.get("count", 0)
@@ -763,7 +860,7 @@ def admin_page():
                         "password_expires": expires
                     }
                     response = api_call(f"/auth/admin/renew-password/{st.session_state['renew_user_id']}", 
-                                      method="POST", data=data)
+                                      method="POST", data=data, require_auth=True)
                     if response and not response.get("error"):
                         st.success("✅ Password renewed successfully!")
                         st.info(f"**New Temporary Password:** `{new_temp_password}`")
@@ -785,7 +882,7 @@ def admin_page():
             
             if st.form_submit_button("Check Status"):
                 if check_username:
-                    response = api_call(f"/auth/check-registration/{check_username}")
+                    response = api_call(f"/auth/check-registration/{check_username}", require_auth=False)
                     if response and not response.get("error"):
                         status = response.get('status', 'unknown')
                         if status == 'completed':
@@ -807,6 +904,56 @@ def admin_page():
                         st.write(f"**Is Admin:** {response.get('is_admin')}")
                         st.write(f"**Document Limit:** {'Unlimited' if response.get('max_documents') in [0, -1] else response.get('max_documents')}")
                         st.write(f"**Created:** {response.get('registration_created')}")
+
+# Profile Page
+def profile_page():
+    st.title("👤 User Profile")
+    
+    # Get current user info
+    response = api_call("/auth/me", require_auth=True)
+    
+    if response and not response.get("error"):
+        st.subheader("Account Information")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.info(f"**User ID:** {response.get('user_id')}")
+            st.info(f"**Username:** {response.get('username')}")
+            st.info(f"**Email:** {response.get('email')}")
+        
+        with col2:
+            st.info(f"**Role:** {'Admin' if response.get('is_admin') else 'User'}")
+            st.info(f"**Document Limit:** {'Unlimited' if response.get('max_documents') in [0, -1] else response.get('max_documents')}")
+            st.info(f"**Account Created:** {response.get('created_at', 'N/A')}")
+        
+        # Change password section
+        st.markdown("---")
+        st.subheader("Change Password")
+        
+        with st.form("change_password_form"):
+            current_password = st.text_input("Current Password", type="password")
+            new_password = st.text_input("New Password", type="password")
+            confirm_password = st.text_input("Confirm New Password", type="password")
+            
+            if st.form_submit_button("Change Password"):
+                if not all([current_password, new_password, confirm_password]):
+                    st.error("All fields are required")
+                elif new_password != confirm_password:
+                    st.error("New passwords don't match")
+                else:
+                    data = {
+                        "current_password": current_password,
+                        "new_password": new_password
+                    }
+                    change_response = api_call("/auth/change-password", method="POST", data=data, require_auth=True)
+                    
+                    if change_response and not change_response.get("error"):
+                        st.success("✅ Password changed successfully!")
+                    else:
+                        st.error(f"Failed to change password: {change_response.get('detail', {}).get('detail', 'Unknown error') if change_response else 'Unknown error'}")
+    else:
+        st.error("Failed to load profile information")
 
 # Main App
 def main():
@@ -980,6 +1127,17 @@ def main():
         .chunk-toggle-button:hover {
             background-color: #5a6268;
         }
+        
+        /* Token info styling */
+        .token-info {
+            font-size: 0.8rem;
+            color: #6c757d;
+            padding: 0.5rem;
+            background-color: #f8f9fa;
+            border-radius: 0.25rem;
+            margin: 0.5rem 0;
+            border-left: 3px solid #17a2b8;
+        }
         </style>
     """, unsafe_allow_html=True)
     
@@ -995,6 +1153,19 @@ def main():
         st.sidebar.write(f"Logged in as: **{st.session_state.username}**")
         st.sidebar.write(f"Role: **{'Admin' if st.session_state.is_admin else 'User'}**")
         
+        # Show session info
+        if st.session_state.token_expiry:
+            try:
+                expiry_time = datetime.fromisoformat(st.session_state.token_expiry)
+                time_left = expiry_time - datetime.now()
+                minutes_left = int(time_left.total_seconds() / 60)
+                if minutes_left > 0:
+                    st.sidebar.markdown(f'<div class="token-info">🔄 Session expires in: {minutes_left} minutes</div>', unsafe_allow_html=True)
+                else:
+                    st.sidebar.warning("⚠️ Session expired. Please refresh.")
+            except:
+                pass
+        
         # Show document limit in sidebar
         if st.session_state.is_admin:
             st.sidebar.write("📊 Document limit: **Unlimited**")
@@ -1004,7 +1175,7 @@ def main():
         
         # Get current PDF count for sidebar
         if st.session_state.user_id:
-            response = api_call(f"/pdf/user/{st.session_state.user_id}/count")
+            response = api_call("/pdf/user/count", require_auth=True)
             if response and not response.get("error"):
                 count = response.get("pdf_count", 0)
                 max_allowed = response.get("max_allowed", 5)
@@ -1021,9 +1192,9 @@ def main():
         st.sidebar.info("Top chunks per query: **5**")
         
         if st.session_state.is_admin:
-            menu = ["💬 Chat", "📁 Documents", "👑 Admin", "🚪 Logout"]
+            menu = ["💬 Chat", "📁 Documents", "👑 Admin", "👤 Profile", "🚪 Logout"]
         else:
-            menu = ["💬 Chat", "📁 Documents", "🚪 Logout"]
+            menu = ["💬 Chat", "📁 Documents", "👤 Profile", "🚪 Logout"]
         
         choice = st.sidebar.selectbox("Go to", menu, key="nav_menu")
         
@@ -1031,11 +1202,17 @@ def main():
         st.sidebar.markdown("---")
         st.sidebar.subheader("Quick Actions")
         
-        if st.sidebar.button("🔄 Refresh Data", key="refresh_btn"):
-            st.rerun()
+        if st.sidebar.button("🔄 Refresh Session", key="refresh_session"):
+            refresh_response = refresh_token_call()
+            if refresh_response and not refresh_response.get("error"):
+                st.sidebar.success("✅ Session refreshed")
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.sidebar.error("❌ Failed to refresh session")
         
         if st.sidebar.button("🔌 Test Connection", key="test_conn"):
-            health = api_call("/health")
+            health = api_call("/health", require_auth=False)
             if health and not health.get("error"):
                 st.sidebar.success("✅ Connected to backend")
             else:
@@ -1052,19 +1229,14 @@ def main():
             else:
                 st.error("❌ Admin access required!")
                 st.info("You need to log in as an administrator to access this page.")
+        elif choice == "👤 Profile":
+            profile_page()
         elif choice == "🚪 Logout":
             if st.sidebar.button("✅ Confirm Logout", key="confirm_logout"):
-                st.session_state.logged_in = False
-                st.session_state.user_id = None
-                st.session_state.username = None
-                st.session_state.is_admin = False
-                st.session_state.chat_history = []
-                st.session_state.expanded_chunks = {}
-                st.session_state.expanded_full_chunks = {}
-                st.session_state.confirm_delete = None
-                st.session_state.user_max_documents = 5
-                st.session_state.processing_question = None
-                st.session_state.last_processed_question = None
+                # Clear all session state
+                for key in list(st.session_state.keys()):
+                    del st.session_state[key]
+                init_session_state()
                 st.success("Logged out successfully!")
                 time.sleep(1)
                 st.rerun()

@@ -1,4 +1,4 @@
-# pdf_processor_simple.py - FINAL WORKING VERSION
+# pdf_processor_simple.py - FINAL WORKING VERSION with Authentication
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Form
 import os
 import psycopg2
@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime
 import io
 import tempfile
-import json  # Added for proper JSON serialization
+import json
 
 # Minimal LangChain imports
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -15,6 +15,9 @@ from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, Te
 
 # Import shared dependencies
 from shared_dependencies import budget_tracker, create_embedding
+
+# Import security
+from security import get_current_active_user, require_admin, TokenData
 
 # Import blob storage manager
 from blob_storage import blob_manager
@@ -43,13 +46,11 @@ def load_document(file_content: bytes, filename: str):
     """Load document using appropriate LangChain loader"""
     file_extension = filename.split('.')[-1].lower()
     
-    # Create a temporary file
     with tempfile.NamedTemporaryFile(suffix=f".{file_extension}", delete=False) as tmp_file:
         tmp_file.write(file_content)
         tmp_file_path = tmp_file.name
     
     try:
-        # Use appropriate loader based on file extension
         if file_extension == "pdf":
             loader = PyPDFLoader(tmp_file_path)
         elif file_extension in ["docx", "doc"]:
@@ -57,26 +58,24 @@ def load_document(file_content: bytes, filename: str):
         elif file_extension in ["txt", "md"]:
             loader = TextLoader(tmp_file_path)
         else:
-            # Default to text loader for unknown types
             loader = TextLoader(tmp_file_path)
         
-        # Load and split documents
         documents = loader.load()
         return documents
     
     finally:
-        # Clean up temporary file
         try:
             os.unlink(tmp_file_path)
         except:
             pass
 
-@router.post("/upload/{user_id}")
+# Protected endpoint - Upload document
+@router.post("/upload")
 async def upload_document(
-    user_id: str,
     file: UploadFile = File(...),
-    is_public: str = Form("false"),  # Changed to Form field, default "false"
-    admin_upload: str = Form("false"),  # Changed to Form field, default "false"
+    is_public: str = Form("false"),
+    admin_upload: str = Form("false"),
+    current_user: TokenData = Depends(get_current_active_user),
     conn = Depends(get_db_connection)
 ):
     cursor = conn.cursor()
@@ -86,40 +85,31 @@ async def upload_document(
         is_public_bool = is_public.lower() == "true"
         admin_upload_bool = admin_upload.lower() == "true"
         
-        print(f"DEBUG: Received parameters - user_id: {user_id}, is_public: {is_public_bool}, admin_upload: {admin_upload_bool}")
-        
-        # Get user's max_documents limit and check if they're admin
-        cursor.execute("""
-            SELECT max_documents, is_admin FROM users WHERE user_id = %s
-        """, (user_id,))
-        
-        user_info = cursor.fetchone()
-        if not user_info:
-            raise HTTPException(status_code=404, detail="User not found")
-        
-        user_max_documents, is_user_admin = user_info
-        
         # Check document count based on user type and limit
-        if is_user_admin:
-            # Admins have no limit (max_documents = -1)
-            can_upload = True
-        elif user_max_documents == -1:
-            # User has unlimited documents (special case)
+        if current_user.is_admin:
             can_upload = True
         else:
-            # Check if user already has reached their limit
             cursor.execute("""
-                SELECT COUNT(*) FROM documents WHERE user_id = %s
-            """, (user_id,))
+                SELECT max_documents FROM users WHERE user_id = %s
+            """, (current_user.user_id,))
             
-            doc_count = cursor.fetchone()[0]
+            user_max_documents = cursor.fetchone()[0]
             
-            if doc_count >= user_max_documents:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Cannot upload more than {user_max_documents} PDFs. You already have {doc_count}."
-                )
-            can_upload = True
+            if user_max_documents == -1:
+                can_upload = True
+            else:
+                cursor.execute("""
+                    SELECT COUNT(*) FROM documents WHERE user_id = %s
+                """, (current_user.user_id,))
+                
+                doc_count = cursor.fetchone()[0]
+                
+                if doc_count >= user_max_documents:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Cannot upload more than {user_max_documents} PDFs. You already have {doc_count}."
+                    )
+                can_upload = True
         
         # Read file content
         content = await file.read()
@@ -127,7 +117,7 @@ async def upload_document(
         # 1. Upload to Azure Blob Storage
         blob_info = blob_manager.upload_pdf(
             file_content=content,
-            user_id=user_id,
+            user_id=current_user.user_id,
             original_filename=file.filename
         )
         
@@ -143,44 +133,35 @@ async def upload_document(
         # Combine all text from documents
         full_text = "\n\n".join([doc.page_content for doc in documents])
         
-        # 3. Split text into chunks using LangChain splitter with new chunk size
+        # 3. Split text into chunks
         text_splitter = get_text_splitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
         chunks = text_splitter.split_text(full_text)
         
-        # 4. Store document metadata WITH blob storage path
-        
-        # SIMPLE AND CORRECT LOGIC:
-        # - Document is public ONLY if admin_upload=True AND is_public=True
-        # - This means only admins can upload public documents, and they must explicitly choose to
-        # - Regular users: admin_upload=False, so document is always private
-        final_is_public = is_public_bool and admin_upload_bool
-        
-        print(f"DEBUG: Document will be public: {final_is_public}")
+        # 4. Store document metadata
+        final_is_public = is_public_bool and admin_upload_bool and current_user.is_admin
         
         document_id = str(uuid.uuid4())
         cursor.execute("""
             INSERT INTO documents (document_id, user_id, filename, blob_storage_path, is_public, uploaded_at)
             VALUES (%s, %s, %s, %s, %s, %s)
             RETURNING document_id
-        """, (document_id, user_id, file.filename, blob_info["blob_url"], final_is_public, datetime.utcnow()))
+        """, (document_id, current_user.user_id, file.filename, blob_info["blob_url"], final_is_public, datetime.utcnow()))
         
-        # 5. Process each chunk: create embedding and store
+        # 5. Process each chunk
         chunks_processed = 0
         for i, chunk in enumerate(chunks):
             chunk_id = str(uuid.uuid4())
             
-            # Create embedding using shared function
             embedding = create_embedding(chunk)
             
-            # Store chunk and embedding
             cursor.execute("""
                 INSERT INTO document_chunks (chunk_id, document_id, user_id, chunk_text, embedding, created_at)
                 VALUES (%s, %s, %s, %s, %s, %s)
-            """, (chunk_id, document_id, user_id, chunk, embedding, datetime.utcnow()))
+            """, (chunk_id, document_id, current_user.user_id, chunk, embedding, datetime.utcnow()))
             
             chunks_processed += 1
         
-        # 6. Log the activity with proper JSON serialization
+        # 6. Log the activity
         details = json.dumps({
             "filename": file.filename,
             "chunks": chunks_processed,
@@ -196,7 +177,7 @@ async def upload_document(
         cursor.execute("""
             INSERT INTO activity_log (user_id, activity_type, details)
             VALUES (%s, %s, %s)
-        """, (user_id, 'UPLOAD_DOCUMENT', details))
+        """, (current_user.user_id, 'UPLOAD_DOCUMENT', details))
         
         conn.commit()
         
@@ -220,13 +201,7 @@ async def upload_document(
             },
             "is_public": final_is_public,
             "admin_upload": admin_upload_bool,
-            "requested_is_public": is_public_bool,
-            "debug": {
-                "received_is_public": is_public,
-                "received_admin_upload": admin_upload,
-                "parsed_is_public": is_public_bool,
-                "parsed_admin_upload": admin_upload_bool
-            }
+            "requested_is_public": is_public_bool
         }
         
     except HTTPException:
@@ -237,17 +212,16 @@ async def upload_document(
     finally:
         cursor.close()
 
-# New endpoint to get user's PDF count
-@router.get("/user/{user_id}/count")
-def get_user_pdf_count(user_id: str):
+# Protected endpoint - Get user's PDF count
+@router.get("/user/count")
+def get_user_pdf_count(current_user: TokenData = Depends(get_current_active_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
     
     try:
-        # Get user's max_documents limit
         cursor.execute("""
             SELECT max_documents, is_admin FROM users WHERE user_id = %s
-        """, (user_id,))
+        """, (current_user.user_id,))
         
         user_info = cursor.fetchone()
         if not user_info:
@@ -257,11 +231,10 @@ def get_user_pdf_count(user_id: str):
         
         cursor.execute("""
             SELECT COUNT(*) FROM documents WHERE user_id = %s
-        """, (user_id,))
+        """, (current_user.user_id,))
         
         count = cursor.fetchone()[0]
         
-        # For admins, they can upload unlimited documents
         if is_user_admin:
             can_upload_more = True
             max_allowed = "unlimited"
@@ -273,7 +246,7 @@ def get_user_pdf_count(user_id: str):
             max_allowed = user_max_documents
         
         return {
-            "user_id": user_id,
+            "user_id": current_user.user_id,
             "pdf_count": count,
             "max_allowed": max_allowed,
             "can_upload_more": can_upload_more,
@@ -285,10 +258,12 @@ def get_user_pdf_count(user_id: str):
         cursor.close()
         conn.close()
 
-# Keep all other endpoints unchanged
+# Protected endpoint - Download PDF
 @router.get("/download/{document_id}")
-def download_pdf(document_id: str):
-    """Download PDF from blob storage"""
+def download_pdf(
+    document_id: str,
+    current_user: TokenData = Depends(get_current_active_user)
+):
     cursor = None
     conn = None
     
@@ -296,29 +271,38 @@ def download_pdf(document_id: str):
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Get blob storage path from database
+        # Get blob storage path and check ownership
         cursor.execute("""
-            SELECT blob_storage_path FROM documents WHERE document_id = %s
+            SELECT user_id, blob_storage_path FROM documents WHERE document_id = %s
         """, (document_id,))
         
         result = cursor.fetchone()
         
-        if not result or not result[0]:
+        if not result or not result[1]:
             raise HTTPException(status_code=404, detail="Document not found or no blob storage path")
         
-        blob_url = result[0]
+        doc_user_id, blob_url = result
+        
+        # Check if user owns the document or if it's public
+        if doc_user_id != current_user.user_id:
+            cursor.execute("""
+                SELECT is_public FROM documents WHERE document_id = %s
+            """, (document_id,))
+            
+            is_public = cursor.fetchone()
+            if not is_public or not is_public[0]:
+                raise HTTPException(status_code=403, detail="You don't have permission to access this document")
+        
         blob_name = '/'.join(blob_url.split('/')[-2:])
         
-        # Download from blob storage
         try:
             pdf_content = blob_manager.download_pdf(blob_name)
             
-            # Log activity with proper JSON
             details = json.dumps({"document_id": document_id})
             cursor.execute("""
                 INSERT INTO activity_log (user_id, activity_type, details)
             VALUES (%s, %s, %s)
-            """, ('system', 'DOWNLOAD_PDF', details))
+            """, (current_user.user_id, 'DOWNLOAD_PDF', details))
             
             conn.commit()
             
@@ -338,9 +322,12 @@ def download_pdf(document_id: str):
         if conn:
             conn.close()
 
+# Protected endpoint - Delete PDF
 @router.delete("/delete/{document_id}")
-def delete_pdf(document_id: str):
-    """Delete PDF from blob storage and database"""
+def delete_pdf(
+    document_id: str,
+    current_user: TokenData = Depends(get_current_active_user)
+):
     cursor = None
     conn = None
     
@@ -359,6 +346,10 @@ def delete_pdf(document_id: str):
         
         user_id, blob_url = result
         
+        # Check ownership
+        if user_id != current_user.user_id and not current_user.is_admin:
+            raise HTTPException(status_code=403, detail="You don't have permission to delete this document")
+        
         if not blob_url:
             raise HTTPException(status_code=400, detail="Document has no blob storage path")
         
@@ -375,7 +366,6 @@ def delete_pdf(document_id: str):
         
         filename = cursor.fetchone()[0]
         
-        # Log activity with proper JSON
         details = json.dumps({
             "document_id": document_id,
             "filename": filename
@@ -383,7 +373,7 @@ def delete_pdf(document_id: str):
         cursor.execute("""
             INSERT INTO activity_log (user_id, activity_type, details)
             VALUES (%s, %s, %s)
-        """, (user_id, 'DELETE_PDF', details))
+        """, (current_user.user_id, 'DELETE_PDF', details))
         
         conn.commit()
         
@@ -400,17 +390,16 @@ def delete_pdf(document_id: str):
         if conn:
             conn.close()
 
-@router.get("/user/{user_id}/documents")
-def get_user_documents(user_id: str):
-    """Get list of documents for a user with blob info"""
+# Protected endpoint - Get user's documents
+@router.get("/user/documents")
+def get_user_documents(current_user: TokenData = Depends(get_current_active_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
     
     try:
-        # Get user's max_documents limit
         cursor.execute("""
             SELECT max_documents, is_admin FROM users WHERE user_id = %s
-        """, (user_id,))
+        """, (current_user.user_id,))
         
         user_info = cursor.fetchone()
         if not user_info:
@@ -429,7 +418,7 @@ def get_user_documents(user_id: str):
             FROM documents d
             WHERE user_id = %s
             ORDER BY uploaded_at DESC
-        """, (user_id,))
+        """, (current_user.user_id,))
         
         documents = cursor.fetchall()
         
@@ -444,7 +433,6 @@ def get_user_documents(user_id: str):
                 "chunk_count": doc[5]
             })
         
-        # Determine max allowed based on user type
         if is_user_admin:
             max_allowed = "unlimited"
         elif user_max_documents == -1:
@@ -453,7 +441,7 @@ def get_user_documents(user_id: str):
             max_allowed = user_max_documents
         
         return {
-            "user_id": user_id,
+            "user_id": current_user.user_id,
             "total_documents": len(documents),
             "documents": result,
             "max_allowed": max_allowed,
@@ -465,19 +453,20 @@ def get_user_documents(user_id: str):
         cursor.close()
         conn.close()
 
-@router.get("/blob/list/{user_id}")
-def list_user_blobs(user_id: str):
-    """List all blobs for a user directly from Azure Blob Storage"""
+# Protected endpoint - List user's blobs
+@router.get("/blob/list")
+def list_user_blobs(current_user: TokenData = Depends(get_current_active_user)):
     try:
-        blobs = blob_manager.list_user_blobs(user_id)
+        blobs = blob_manager.list_user_blobs(current_user.user_id)
         return {
-            "user_id": user_id,
+            "user_id": current_user.user_id,
             "total_blobs": len(blobs),
             "blobs": blobs
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# Public endpoint - Budget status
 @router.get("/budget/status")
 def get_budget_status():
     return {
@@ -486,10 +475,9 @@ def get_budget_status():
         "max_budget": budget_tracker.max_budget
     }
 
-# Admin endpoint to list all PDFs in system
+# Admin-only endpoint - List all PDFs
 @router.get("/admin/all-documents")
-def get_all_documents():
-    """Admin endpoint: Get all documents in the system"""
+def get_all_documents(current_user: TokenData = Depends(require_admin)):
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -532,3 +520,104 @@ def get_all_documents():
     finally:
         cursor.close()
         conn.close()
+
+# Admin-only endpoint - Upload for any user
+@router.post("/admin/upload-for-user/{target_user_id}")
+async def admin_upload_for_user(
+    target_user_id: str,
+    file: UploadFile = File(...),
+    is_public: str = Form("true"),
+    current_user: TokenData = Depends(require_admin),
+    conn = Depends(get_db_connection)
+):
+    cursor = conn.cursor()
+    
+    try:
+        is_public_bool = is_public.lower() == "true"
+        
+        # Check if target user exists
+        cursor.execute("SELECT username FROM users WHERE user_id = %s", (target_user_id,))
+        target_user = cursor.fetchone()
+        if not target_user:
+            raise HTTPException(status_code=404, detail="Target user not found")
+        
+        # Read file content
+        content = await file.read()
+        
+        # Upload to Azure Blob Storage
+        blob_info = blob_manager.upload_pdf(
+            file_content=content,
+            user_id=target_user_id,
+            original_filename=file.filename
+        )
+        
+        # Extract text
+        documents = load_document(content, file.filename)
+        
+        if not documents:
+            raise HTTPException(
+                status_code=400,
+                detail="Document appears to be empty or cannot be processed"
+            )
+        
+        full_text = "\n\n".join([doc.page_content for doc in documents])
+        
+        # Split text into chunks
+        text_splitter = get_text_splitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+        chunks = text_splitter.split_text(full_text)
+        
+        # Store document metadata - admin uploads can be public
+        document_id = str(uuid.uuid4())
+        cursor.execute("""
+            INSERT INTO documents (document_id, user_id, filename, blob_storage_path, is_public, uploaded_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING document_id
+        """, (document_id, target_user_id, file.filename, blob_info["blob_url"], is_public_bool, datetime.utcnow()))
+        
+        # Process each chunk
+        chunks_processed = 0
+        for i, chunk in enumerate(chunks):
+            chunk_id = str(uuid.uuid4())
+            
+            embedding = create_embedding(chunk)
+            
+            cursor.execute("""
+                INSERT INTO document_chunks (chunk_id, document_id, user_id, chunk_text, embedding, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (chunk_id, document_id, target_user_id, chunk, embedding, datetime.utcnow()))
+            
+            chunks_processed += 1
+        
+        # Log the activity
+        details = json.dumps({
+            "filename": file.filename,
+            "target_user_id": target_user_id,
+            "chunks": chunks_processed,
+            "is_public": is_public_bool,
+            "uploaded_by_admin": current_user.username
+        })
+        cursor.execute("""
+            INSERT INTO activity_log (user_id, activity_type, details)
+            VALUES (%s, %s, %s)
+        """, (current_user.user_id, 'ADMIN_UPLOAD_FOR_USER', details))
+        
+        conn.commit()
+        
+        return {
+            "message": "Document uploaded successfully for user",
+            "document_id": document_id,
+            "filename": file.filename,
+            "target_user_id": target_user_id,
+            "target_username": target_user[0],
+            "chunks_created": chunks_processed,
+            "is_public": is_public_bool,
+            "uploaded_by_admin": current_user.username
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Document processing error: {str(e)}")
+    finally:
+        cursor.close()

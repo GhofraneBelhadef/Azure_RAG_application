@@ -1,5 +1,5 @@
-# rag_engine.py - Modified to return chunk contents
-from fastapi import APIRouter, HTTPException
+# rag_engine.py - Fixed version with authentication
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 import os
 import psycopg2
@@ -7,26 +7,21 @@ import json
 from database import get_db_connection
 from datetime import datetime, timedelta
 import uuid
-from typing import List, Dict, Any
 
 # Import shared dependencies
 from shared_dependencies import chat_client, budget_tracker, create_embedding
+
+# Import security
+from security import get_current_active_user, TokenData
 
 router = APIRouter(prefix="/chat", tags=["rag engine"])
 
 # Pydantic model for chat request
 class ChatRequest(BaseModel):
-    user_id: str
     question: str
     use_public_data: bool = True
 
-# Pydantic model for chunk data
-class ChunkData(BaseModel):
-    chunk_id: str
-    content: str
-    similarity: float
-
-def search_similar_chunks(query_embedding: list, user_id: str, use_public_data: bool = True, limit: int = 5) -> List[Dict[str, Any]]:
+def search_similar_chunks(query_embedding: list, user_id: str, use_public_data: bool = True, limit: int = 5):
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -75,8 +70,7 @@ def search_similar_chunks(query_embedding: list, user_id: str, use_public_data: 
         cursor.close()
         conn.close()
 
-def get_chunk_source_info(chunk_ids: List[str]) -> List[Dict[str, Any]]:
-    """Get source document information for chunks"""
+def get_chunk_source_info(chunk_ids: list):
     if not chunk_ids:
         return []
     
@@ -84,7 +78,6 @@ def get_chunk_source_info(chunk_ids: List[str]) -> List[Dict[str, Any]]:
     cursor = conn.cursor()
     
     try:
-        # Create a string of chunk IDs for SQL IN clause
         chunk_ids_str = ",".join([f"'{chunk_id}'" for chunk_id in chunk_ids])
         
         query = f"""
@@ -146,18 +139,22 @@ def get_recent_conversation_history(user_id: str, hours: int = 24):
         cursor.close()
         conn.close()
 
+# Protected endpoint - Chat with RAG
 @router.post("/ask")
-def chat_with_rag(chat_request: ChatRequest):
+def chat_with_rag(
+    chat_request: ChatRequest,
+    current_user: TokenData = Depends(get_current_active_user)
+):
     try:
         # 1. Create embedding for the question
         query_embedding = create_embedding(chat_request.question)
         
-        # 2. Search for similar chunks with more details
+        # 2. Search for similar chunks
         similar_chunks = search_similar_chunks(
             query_embedding, 
-            chat_request.user_id, 
+            current_user.user_id, 
             chat_request.use_public_data,
-            limit=5  # Get top 5 chunks
+            limit=5
         )
         
         if not similar_chunks:
@@ -186,9 +183,9 @@ def chat_with_rag(chat_request: ChatRequest):
                                  for i, chunk in enumerate(context_chunks)])
         
         # 3. Get recent conversation history
-        recent_history = get_recent_conversation_history(chat_request.user_id)
+        recent_history = get_recent_conversation_history(current_user.user_id)
         
-        # 4. Prepare the prompt with numbered chunks
+        # 4. Prepare the prompt
         prompt = f"""You are a helpful assistant. Use the following context to answer the question.
 
 Recent conversation history:
@@ -203,7 +200,7 @@ Provide a helpful answer based on the context above. If the context doesn't cont
 
 After your answer, briefly mention which context excerpts (if any) were most relevant to your response."""
 
-        # 5. Generate response using Azure OpenAI
+        # 5. Generate response
         response = chat_client.chat.completions.create(
             model=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT"),
             messages=[
@@ -215,7 +212,7 @@ After your answer, briefly mention which context excerpts (if any) were most rel
         
         ai_response = response.choices[0].message.content
         
-        # 6. Get source document information for the chunks used
+        # 6. Get source document information
         source_info = []
         if chunk_details:
             source_info = get_chunk_source_info(chunk_ids)
@@ -228,9 +225,9 @@ After your answer, briefly mention which context excerpts (if any) were most rel
         cursor.execute("""
             INSERT INTO chat_history (chat_id, user_id, user_message, ai_response, context_chunk_ids, created_at)
             VALUES (%s, %s, %s, %s, %s, %s)
-        """, (chat_id, chat_request.user_id, chat_request.question, ai_response, chunk_ids, datetime.utcnow()))
+        """, (chat_id, current_user.user_id, chat_request.question, ai_response, chunk_ids, datetime.utcnow()))
         
-        # Log activity with proper JSON serialization
+        # Log activity
         details = json.dumps({
             "question_length": len(chat_request.question),
             "chunks_used": len(chunk_ids),
@@ -239,18 +236,18 @@ After your answer, briefly mention which context excerpts (if any) were most rel
         cursor.execute("""
             INSERT INTO activity_log (user_id, activity_type, details)
             VALUES (%s, %s, %s)
-        """, (chat_request.user_id, 'CHAT', details))
+        """, (current_user.user_id, 'CHAT', details))
         
         conn.commit()
         cursor.close()
         conn.close()
         
-        # 8. Prepare response with chunk details
+        # 8. Prepare response
         response_data = {
             "answer": ai_response,
             "chunks_used": len(chunk_ids),
-            "chunks": chunk_details,  # Basic chunk info with preview
-            "sources": source_info,   # Full source information
+            "chunks": chunk_details,
+            "sources": source_info,
             "chat_id": chat_id,
             "budget_status": budget_tracker.get_status()
         }
@@ -262,24 +259,30 @@ After your answer, briefly mention which context excerpts (if any) were most rel
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Chat error: {str(e)}")
 
-# New endpoint to get detailed chunk info
+# Protected endpoint - Get chat chunks
 @router.get("/chat/{chat_id}/chunks")
-def get_chat_chunks(chat_id: str):
-    """Get the chunks used for a specific chat"""
+def get_chat_chunks(
+    chat_id: str,
+    current_user: TokenData = Depends(get_current_active_user)
+):
     conn = get_db_connection()
     cursor = conn.cursor()
     
     try:
         # Get the chat to find chunk IDs
         cursor.execute("""
-            SELECT context_chunk_ids FROM chat_history WHERE chat_id = %s
+            SELECT user_id, context_chunk_ids FROM chat_history WHERE chat_id = %s
         """, (chat_id,))
         
         result = cursor.fetchone()
         if not result:
             raise HTTPException(status_code=404, detail="Chat not found")
         
-        chunk_ids = result[0] or []
+        chat_user_id, chunk_ids = result
+        
+        # Check ownership
+        if chat_user_id != current_user.user_id and not current_user.is_admin:
+            raise HTTPException(status_code=403, detail="You don't have permission to access this chat")
         
         if not chunk_ids:
             return {"chunks": [], "sources": []}
@@ -323,8 +326,12 @@ def get_chat_chunks(chat_id: str):
         cursor.close()
         conn.close()
 
-@router.post("/cleanup/{user_id}")
-def cleanup_old_conversations(user_id: str, days_old: int = 30):
+# Protected endpoint - Cleanup old conversations
+@router.post("/cleanup")
+def cleanup_old_conversations(
+    days_old: int = 30,
+    current_user: TokenData = Depends(get_current_active_user)
+):
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -335,7 +342,7 @@ def cleanup_old_conversations(user_id: str, days_old: int = 30):
             DELETE FROM chat_history 
             WHERE user_id = %s AND created_at < %s
             RETURNING COUNT(*)
-        """, (user_id, cutoff_date))
+        """, (current_user.user_id, cutoff_date))
         
         deleted_count = cursor.fetchone()[0]
         conn.commit()
@@ -346,6 +353,34 @@ def cleanup_old_conversations(user_id: str, days_old: int = 30):
         cursor.close()
         conn.close()
 
+# Admin-only endpoint - Cleanup all conversations
+@router.post("/admin/cleanup-all")
+def cleanup_all_conversations(
+    days_old: int = 30,
+    current_user: TokenData = Depends(require_admin)
+):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cutoff_date = datetime.utcnow() - timedelta(days=days_old)
+        
+        cursor.execute("""
+            DELETE FROM chat_history 
+            WHERE created_at < %s
+            RETURNING COUNT(*)
+        """, (cutoff_date,))
+        
+        deleted_count = cursor.fetchone()[0]
+        conn.commit()
+        
+        return {"message": f"Deleted {deleted_count} old conversations for all users"}
+        
+    finally:
+        cursor.close()
+        conn.close()
+
+# Public endpoint - Budget status
 @router.get("/budget")
 def get_chat_budget():
     return {

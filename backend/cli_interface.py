@@ -1,4 +1,4 @@
-# backend/cli_interface.py - Updated with document limit support and new admin-controlled registration system
+# backend/cli_interface.py - Updated with JWT Authentication
 import sys
 import os
 import json
@@ -10,6 +10,7 @@ from database import get_db_connection
 from shared_dependencies import create_embedding
 import psycopg2
 import glob
+import time
 
 class CLIInterface:
     def __init__(self):
@@ -17,8 +18,9 @@ class CLIInterface:
         self.current_username = None
         self.is_admin = False
         self.backend_url = "http://localhost:8000"
-        self.token = None
-        self.admin_token = None  # Store admin token for admin operations
+        self.access_token = None
+        self.refresh_token = None
+        self.token_expiry = None
     
     def clear_screen(self):
         """Clear console screen"""
@@ -30,8 +32,8 @@ class CLIInterface:
         print(f" {title}")
         print("="*60)
     
-    def api_call(self, endpoint, method="GET", data=None, files=None, headers=None):
-        """Make API call to backend"""
+    def api_call(self, endpoint, method="GET", data=None, files=None, headers=None, require_auth=True):
+        """Make API call to backend with token handling"""
         try:
             url = f"{self.backend_url}{endpoint}"
             
@@ -39,6 +41,17 @@ class CLIInterface:
             request_headers = {}
             if headers:
                 request_headers.update(headers)
+            
+            # Add authorization header if required
+            if require_auth and self.access_token:
+                request_headers["Authorization"] = f"Bearer {self.access_token}"
+            
+            # Check token expiry and refresh if needed
+            if require_auth and self.token_expiry:
+                if datetime.now() > self.token_expiry:
+                    self.refresh_access_token()
+                    if self.access_token:
+                        request_headers["Authorization"] = f"Bearer {self.access_token}"
             
             if method == "GET":
                 response = requests.get(url, headers=request_headers)
@@ -55,18 +68,59 @@ class CLIInterface:
             
             if response.status_code in [200, 201]:
                 return response.json()
-            else:
-                # Try to parse error message
-                try:
-                    error_data = response.json()
-                    error_msg = error_data.get("detail", response.text)
-                except:
-                    error_msg = response.text
-                print(f"❌ Error {response.status_code}: {error_msg}")
-                return None
+            elif response.status_code == 401 and require_auth:
+                # Token might be expired, try to refresh
+                if self.refresh_access_token():
+                    # Retry with new token
+                    request_headers["Authorization"] = f"Bearer {self.access_token}"
+                    
+                    if method == "GET":
+                        response = requests.get(url, headers=request_headers)
+                    elif method == "POST" and files:
+                        response = requests.post(url, files=files, data=data, headers=request_headers)
+                    elif method == "POST":
+                        response = requests.post(url, json=data, headers=request_headers)
+                    elif method == "DELETE":
+                        response = requests.delete(url, headers=request_headers)
+                    
+                    if response.status_code in [200, 201]:
+                        return response.json()
+            
+            # Try to parse error message
+            try:
+                error_data = response.json()
+                error_msg = error_data.get("detail", response.text)
+            except:
+                error_msg = response.text
+            
+            print(f"❌ Error {response.status_code}: {error_msg}")
+            return None
+            
         except Exception as e:
             print(f"❌ Connection error: {str(e)}")
             return None
+    
+    def refresh_access_token(self):
+        """Refresh access token using refresh token"""
+        if not self.refresh_token:
+            print("❌ No refresh token available")
+            return False
+        
+        try:
+            data = {"refresh_token": self.refresh_token}
+            response = self.api_call("/auth/refresh", method="POST", data=data, require_auth=False)
+            
+            if response and not response.get("error"):
+                self.access_token = response.get("access_token")
+                self.token_expiry = datetime.now()  # Reset expiry
+                print("✅ Access token refreshed")
+                return True
+            else:
+                print("❌ Failed to refresh token")
+                return False
+        except Exception as e:
+            print(f"❌ Token refresh error: {str(e)}")
+            return False
     
     def login(self):
         """Login to the system (for regular users)"""
@@ -77,12 +131,16 @@ class CLIInterface:
         password = getpass.getpass("Password: ")
         
         data = {"username": username, "password": password}
-        response = self.api_call("/auth/login", method="POST", data=data)
+        response = self.api_call("/auth/login", method="POST", data=data, require_auth=False)
         
         if response:
             self.current_user_id = response.get("user_id")
             self.current_username = username
             self.is_admin = response.get("is_admin", False)
+            self.access_token = response.get("access_token")
+            self.refresh_token = response.get("refresh_token")
+            self.token_expiry = datetime.now()  # Will refresh as needed
+            
             print(f"\n✅ Welcome {username}!")
             print(f"   Role: {'Admin' if self.is_admin else 'User'}")
             return True
@@ -100,13 +158,17 @@ class CLIInterface:
         
         data = {"username": username, "password": password}
         
-        response = self.api_call("/auth/login", method="POST", data=data)
+        response = self.api_call("/auth/login", method="POST", data=data, require_auth=False)
         
         if response:
             if response.get("is_admin"):
                 self.current_user_id = response.get("user_id")
                 self.current_username = username
                 self.is_admin = True
+                self.access_token = response.get("access_token")
+                self.refresh_token = response.get("refresh_token")
+                self.token_expiry = datetime.now()
+                
                 print(f"\n✅ Admin login successful!")
                 print(f"   Welcome, {username}!")
                 return True
@@ -138,7 +200,7 @@ class CLIInterface:
             "new_password": new_password
         }
         
-        response = self.api_call("/auth/complete-registration", method="POST", data=data)
+        response = self.api_call("/auth/complete-registration", method="POST", data=data, require_auth=False)
         
         if response:
             print(f"\n✅ Registration completed successfully!")
@@ -154,10 +216,11 @@ class CLIInterface:
             self.clear_screen()
             self.print_header(f"ADMIN MAIN MENU - {self.current_username}")
             print("1. User Management")
-            print("2. Chat Management")
-            print("3. Data Management")
+            print("2. Document Management")
+            print("3. Chat Management")
             print("4. VectorDB Management")
             print("5. System Status")
+            print("6. My Profile")
             print("0. Logout")
             print("="*60)
             
@@ -166,13 +229,15 @@ class CLIInterface:
             if choice == "1":
                 self.user_management_menu()
             elif choice == "2":
-                self.chat_management_menu()
+                self.document_management_menu()
             elif choice == "3":
-                self.data_management_menu()
+                self.chat_management_menu()
             elif choice == "4":
                 self.vectordb_management_menu()
             elif choice == "5":
                 self.system_status()
+            elif choice == "6":
+                self.user_profile()
             elif choice == "0":
                 self.logout()
                 return
@@ -272,7 +337,7 @@ class CLIInterface:
         email = input("Email: ").strip()
         
         # Check if username already exists
-        response = self.api_call(f"/auth/check-registration/{username}")
+        response = self.api_call(f"/auth/check-registration/{username}", require_auth=False)
         if response and response.get("detail") != "User not found":
             print(f"❌ Username '{username}' already exists!")
             input("Press Enter to continue...")
@@ -390,54 +455,24 @@ class CLIInterface:
             print(f"\nGenerating new temporary password for {username}...")
             print(f"New temporary password: {new_temp_password}")
             
-            temp_password_hash = self.hash_password(new_temp_password)
-            current_time = datetime.utcnow()
+            # Use API to renew password
+            data = {
+                "temporary_password": new_temp_password,
+                "password_expires": True
+            }
             
-            # Update database
-            conn = get_db_connection()
-            cursor = conn.cursor()
+            response = self.api_call(f"/auth/admin/renew-password/{user_id}", method="POST", data=data)
             
-            try:
-                cursor.execute("""
-                    UPDATE users 
-                    SET registration_password_hash = %s,
-                        registration_created_at = %s,
-                        registration_used = false
-                    WHERE user_id = %s
-                """, (temp_password_hash, current_time, user_id))
-                
-                # Log activity
-                details = json.dumps({
-                    "username": username,
-                    "email": email,
-                    "reason": "admin_reset"
-                })
-                cursor.execute("""
-                    INSERT INTO activity_log (user_id, activity_type, details)
-                    VALUES (%s, %s, %s)
-                """, (user_id, 'ADMIN_RESET_REGISTRATION', details))
-                
-                conn.commit()
+            if response:
                 print(f"✅ Registration reset successfully!")
                 print(f"   New temporary password: {new_temp_password}")
                 print(f"   Give this to the user to complete registration.")
-            except Exception as e:
-                conn.rollback()
-                print(f"❌ Failed to reset registration: {e}")
-            finally:
-                cursor.close()
-                conn.close()
+            else:
+                print(f"❌ Failed to reset registration")
         else:
             print("Cancelled")
         
         input("\nPress Enter to continue...")
-    
-    def hash_password(self, password: str) -> str:
-        """Hash password (simplified version for CLI)"""
-        import hashlib
-        import base64
-        # Simple hash for CLI purposes
-        return hashlib.sha256(password.encode()).hexdigest()
     
     def renew_user_password(self):
         """Renew temporary password for user"""
@@ -450,7 +485,7 @@ class CLIInterface:
         username = input("Username: ").strip()
         
         # Get user info
-        response = self.api_call(f"/auth/check-registration/{username}")
+        response = self.api_call(f"/auth/check-registration/{username}", require_auth=False)
         if not response or response.get("detail") == "User not found":
             print("❌ User not found!")
             input("Press Enter to continue...")
@@ -502,7 +537,7 @@ class CLIInterface:
         print("\n--- Check Registration Status ---")
         username = input("Username: ").strip()
         
-        response = self.api_call(f"/auth/check-registration/{username}")
+        response = self.api_call(f"/auth/check-registration/{username}", require_auth=False)
         
         if response:
             if response.get("detail") == "User not found":
@@ -534,71 +569,11 @@ class CLIInterface:
         
         input("\nPress Enter to continue...")
     
-    def chat_management_menu(self):
-        """Chat management submenu"""
+    def document_management_menu(self):
+        """Document management submenu"""
         while True:
             self.clear_screen()
-            self.print_header("CHAT MANAGEMENT")
-            print("1. View user chat history")
-            print("0. Back to main menu")
-            print("="*60)
-            
-            choice = input("\nSelect option: ").strip()
-            
-            if choice == "1":
-                self.view_user_chat_history()
-            elif choice == "0":
-                return
-            else:
-                input("\n❌ Invalid option. Press Enter to continue...")
-    
-    def view_user_chat_history(self):
-        """View chat history for a user"""
-        user_id = input("\nUser ID: ").strip()
-        limit = input("Number of messages to show (default 20): ").strip()
-        limit = int(limit) if limit else 20
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute("""
-                SELECT chat_id, user_message, ai_response, created_at
-                FROM chat_history 
-                WHERE user_id = %s
-                ORDER BY created_at DESC
-                LIMIT %s
-            """, (user_id, limit))
-            
-            chats = cursor.fetchall()
-            
-            if not chats:
-                print("\nNo chat history found for this user")
-            else:
-                print(f"\nChat History for user {user_id}:")
-                print("-"*80)
-                
-                for chat in chats:
-                    chat_id, user_msg, ai_resp, created_at = chat
-                    print(f"\n[{created_at.strftime('%Y-%m-%d %H:%M:%S')}]")
-                    print(f"User: {user_msg[:100]}{'...' if len(user_msg) > 100 else ''}")
-                    print(f"AI: {ai_resp[:100]}{'...' if len(ai_resp) > 100 else ''}")
-                    print(f"Chat ID: {chat_id}")
-                    print("-"*40)
-                
-                print(f"\nTotal chats shown: {len(chats)}")
-        
-        finally:
-            cursor.close()
-            conn.close()
-        
-        input("\nPress Enter to continue...")
-    
-    def data_management_menu(self):
-        """Data management submenu"""
-        while True:
-            self.clear_screen()
-            self.print_header("DATA MANAGEMENT")
+            self.print_header("DOCUMENT MANAGEMENT")
             print("1. Upload PDF(s) for user")
             print("2. Upload all PDFs from folder for user")
             print("3. List all PDFs")
@@ -646,9 +621,10 @@ class CLIInterface:
         
         # Check user's current PDF count (only if not admin/unlimited)
         if not is_user_admin and max_documents not in [0, -1]:
-            count_response = self.api_call(f"/pdf/user/{user_id}/count")
-            if count_response:
-                pdf_count = count_response.get("pdf_count", 0)
+            # Use API to check PDF count
+            response = self.api_call(f"/pdf/user/count")
+            if response:
+                pdf_count = response.get("pdf_count", 0)
                 if pdf_count >= max_documents:
                     print(f"❌ User already has {pdf_count} PDFs (max: {max_documents})")
                     input("Press Enter to continue...")
@@ -667,32 +643,35 @@ class CLIInterface:
         
         print(f"\nUploading {file_path} for user {username}...")
         
-        with open(file_path, 'rb') as f:
-            files = {"file": (os.path.basename(file_path), f, "application/pdf")}
-            data = {
-                "is_public": str(is_public).lower(),
-                "admin_upload": "true"  # This tells backend it's an admin upload
-            }
-            
-            response = self.api_call(
-                f"/pdf/upload/{user_id}",
-                method="POST",
-                files=files,
-                data=data
-            )
-            
-            if response:
-                print("✅ Upload successful!")
-                print(f"Document ID: {response.get('document_id')}")
-                print(f"Chunks created: {response.get('chunks_created')}")
-                if response.get('is_public'):
-                    print("📢 Document is PUBLIC (visible to all users)")
+        try:
+            with open(file_path, 'rb') as f:
+                files = {"file": (os.path.basename(file_path), f, "application/pdf")}
+                data = {
+                    "is_public": str(is_public).lower(),
+                    "admin_upload": "true"
+                }
+                
+                response = self.api_call(
+                    f"/pdf/admin/upload-for-user/{user_id}",
+                    method="POST",
+                    files=files,
+                    data=data
+                )
+                
+                if response:
+                    print("✅ Upload successful!")
+                    print(f"Document ID: {response.get('document_id')}")
+                    print(f"Chunks created: {response.get('chunks_created')}")
+                    if response.get('is_public'):
+                        print("📢 Document is PUBLIC (visible to all users)")
+                    else:
+                        print("🔒 Document is PRIVATE (only the user can access)")
+                    print(f"Chunk size: {response.get('chunk_settings', {}).get('chunk_size', 300)}")
+                    print(f"Chunk overlap: {response.get('chunk_settings', {}).get('chunk_overlap', 30)}")
                 else:
-                    print("🔒 Document is PRIVATE (only the user can access)")
-                print(f"Chunk size: {response.get('chunk_settings', {}).get('chunk_size', 300)}")
-                print(f"Chunk overlap: {response.get('chunk_settings', {}).get('chunk_overlap', 30)}")
-            else:
-                print("❌ Upload failed!")
+                    print("❌ Upload failed!")
+        except Exception as e:
+            print(f"❌ Upload error: {str(e)}")
         
         input("\nPress Enter to continue...")
     
@@ -734,9 +713,9 @@ class CLIInterface:
         # Check current PDF count if user has limits
         current_count = 0
         if not is_user_admin and max_documents not in [0, -1]:
-            count_response = self.api_call(f"/pdf/user/{user_id}/count")
-            if count_response:
-                current_count = count_response.get("pdf_count", 0)
+            response = self.api_call(f"/pdf/user/count")
+            if response:
+                current_count = response.get("pdf_count", 0)
                 if current_count >= max_documents:
                     print(f"❌ User already has {current_count} PDFs (max: {max_documents})")
                     input("Press Enter to continue...")
@@ -750,35 +729,38 @@ class CLIInterface:
         for pdf_file in pdf_files:
             # Check if user can upload more (only for limited users)
             if not is_user_admin and max_documents not in [0, -1]:
-                count_response = self.api_call(f"/pdf/user/{user_id}/count")
-                if count_response:
-                    pdf_count = count_response.get("pdf_count", 0)
+                response = self.api_call(f"/pdf/user/count")
+                if response:
+                    pdf_count = response.get("pdf_count", 0)
                     if pdf_count >= max_documents:
                         print(f"\n⚠️  User reached {max_documents} PDF limit. Stopping upload.")
                         break
             
             print(f"\nUploading: {os.path.basename(pdf_file)}")
             
-            with open(pdf_file, 'rb') as f:
-                files = {"file": (os.path.basename(pdf_file), f, "application/pdf")}
-                data = {
-                    "is_public": str(is_public).lower(),
-                    "admin_upload": "true"
-                }
-                
-                response = self.api_call(
-                    f"/pdf/upload/{user_id}",
-                    method="POST",
-                    files=files,
-                    data=data
-                )
-                
-                if response:
-                    visibility = "PUBLIC" if response.get('is_public') else "PRIVATE"
-                    print(f"  ✅ Success! (Chunks: {response.get('chunks_created')}, {visibility})")
-                    uploaded_count += 1
-                else:
-                    print(f"  ❌ Failed!")
+            try:
+                with open(pdf_file, 'rb') as f:
+                    files = {"file": (os.path.basename(pdf_file), f, "application/pdf")}
+                    data = {
+                        "is_public": str(is_public).lower(),
+                        "admin_upload": "true"
+                    }
+                    
+                    response = self.api_call(
+                        f"/pdf/admin/upload-for-user/{user_id}",
+                        method="POST",
+                        files=files,
+                        data=data
+                    )
+                    
+                    if response:
+                        visibility = "PUBLIC" if response.get('is_public') else "PRIVATE"
+                        print(f"  ✅ Success! (Chunks: {response.get('chunks_created')}, {visibility})")
+                        uploaded_count += 1
+                    else:
+                        print(f"  ❌ Failed!")
+            except Exception as e:
+                print(f"  ❌ Error: {str(e)}")
         
         print(f"\n✅ Uploaded {uploaded_count} out of {len(pdf_files)} PDFs")
         print(f"📊 User {username} now has approximately {current_count + uploaded_count} PDFs")
@@ -843,24 +825,23 @@ class CLIInterface:
         
         try:
             cursor.execute("""
-                SELECT COUNT(*) FROM documents WHERE is_public = true
+                SELECT document_id, filename FROM documents WHERE is_public = true
             """)
             
-            count = cursor.fetchone()[0]
+            public_docs = cursor.fetchall()
             
-            if count == 0:
+            if not public_docs:
                 print("No public PDFs found.")
                 input("\nPress Enter to continue...")
                 return
             
-            confirm = input(f"WARNING: This will delete {count} public PDFs! Continue? (y/n): ").strip().lower()
+            print(f"Found {len(public_docs)} public PDFs:")
+            for doc_id, filename in public_docs:
+                print(f"  - {filename} ({doc_id})")
+            
+            confirm = input(f"\nWARNING: This will delete {len(public_docs)} public PDFs! Continue? (y/n): ").strip().lower()
             
             if confirm == 'y':
-                cursor.execute("""
-                    SELECT document_id, filename FROM documents WHERE is_public = true
-                """)
-                
-                public_docs = cursor.fetchall()
                 deleted_count = 0
                 
                 for doc_id, filename in public_docs:
@@ -868,14 +849,95 @@ class CLIInterface:
                     if response:
                         deleted_count += 1
                         print(f"Deleted: {filename}")
+                    else:
+                        print(f"Failed to delete: {filename}")
                 
-                print(f"\n✅ Deleted {deleted_count} out of {count} public PDFs")
+                print(f"\n✅ Deleted {deleted_count} out of {len(public_docs)} public PDFs")
             else:
                 print("Cancelled")
         
         finally:
             cursor.close()
             conn.close()
+        
+        input("\nPress Enter to continue...")
+    
+    def chat_management_menu(self):
+        """Chat management submenu"""
+        while True:
+            self.clear_screen()
+            self.print_header("CHAT MANAGEMENT")
+            print("1. View user chat history")
+            print("2. Clear my chat history")
+            print("0. Back to main menu")
+            print("="*60)
+            
+            choice = input("\nSelect option: ").strip()
+            
+            if choice == "1":
+                self.view_user_chat_history()
+            elif choice == "2":
+                self.clear_my_chat_history()
+            elif choice == "0":
+                return
+            else:
+                input("\n❌ Invalid option. Press Enter to continue...")
+    
+    def view_user_chat_history(self):
+        """View chat history for a user"""
+        user_id = input("\nUser ID: ").strip()
+        limit = input("Number of messages to show (default 20): ").strip()
+        limit = int(limit) if limit else 20
+        
+        # Use direct database query for now (or create an API endpoint)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("""
+                SELECT chat_id, user_message, ai_response, created_at
+                FROM chat_history 
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+            """, (user_id, limit))
+            
+            chats = cursor.fetchall()
+            
+            if not chats:
+                print("\nNo chat history found for this user")
+            else:
+                print(f"\nChat History for user {user_id}:")
+                print("-"*80)
+                
+                for chat in chats:
+                    chat_id, user_msg, ai_resp, created_at = chat
+                    print(f"\n[{created_at.strftime('%Y-%m-%d %H:%M:%S')}]")
+                    print(f"User: {user_msg[:100]}{'...' if len(user_msg) > 100 else ''}")
+                    print(f"AI: {ai_resp[:100]}{'...' if len(ai_resp) > 100 else ''}")
+                    print(f"Chat ID: {chat_id}")
+                    print("-"*40)
+                
+                print(f"\nTotal chats shown: {len(chats)}")
+        
+        finally:
+            cursor.close()
+            conn.close()
+        
+        input("\nPress Enter to continue...")
+    
+    def clear_my_chat_history(self):
+        """Clear my chat history"""
+        confirm = input("Are you sure you want to clear your chat history? (y/n): ").strip().lower()
+        
+        if confirm == 'y':
+            data = {"days_old": 0}
+            response = self.api_call("/chat/cleanup", method="POST", data=data)
+            
+            if response:
+                print("✅ Chat history cleared successfully!")
+            else:
+                print("❌ Failed to clear chat history")
         
         input("\nPress Enter to continue...")
     
@@ -915,282 +977,14 @@ class CLIInterface:
             else:
                 input("\n❌ Invalid option. Press Enter to continue...")
     
-    def ingest_all_public_pdfs(self):
-        """Ingest all public PDFs (re-process)"""
-        print("\n--- Ingest All Public PDFs ---")
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute("""
-                SELECT document_id, filename, user_id FROM documents WHERE is_public = true
-            """)
-            
-            public_docs = cursor.fetchall()
-            
-            if not public_docs:
-                print("No public PDFs found.")
-                input("\nPress Enter to continue...")
-                return
-            
-            print(f"Found {len(public_docs)} public PDFs to re-ingest")
-            confirm = input("Continue? (y/n): ").strip().lower()
-            
-            if confirm != 'y':
-                print("Cancelled")
-                input("\nPress Enter to continue...")
-                return
-            
-            # Note: This would need a re-processing endpoint
-            print("⚠️  Re-ingestion endpoint not implemented yet")
-            print("PDFs are automatically ingested on upload")
-            print(f"Current chunk size: 300")
-            print(f"Current chunk overlap: 30")
-            
-        finally:
-            cursor.close()
-            conn.close()
-        
-        input("\nPress Enter to continue...")
-    
-    def ingest_pdf_by_filename(self):
-        """Ingest PDF by filename"""
-        print("\n--- Ingest PDF by Filename ---")
-        filename = input("Filename: ").strip()
-        user_id = input("User ID (leave empty for all users): ").strip() or None
-        
-        if user_id:
-            # Ingest for specific user
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            try:
-                cursor.execute("""
-                    SELECT document_id FROM documents 
-                    WHERE filename = %s AND user_id = %s
-                """, (filename, user_id))
-                
-                doc = cursor.fetchone()
-                
-                if doc:
-                    print(f"Found document: {doc[0]}")
-                    print("⚠️  Re-ingestion endpoint not implemented yet")
-                    print("PDFs are automatically ingested on upload")
-                else:
-                    print("Document not found for this user")
-            
-            finally:
-                cursor.close()
-                conn.close()
-        else:
-            # Ingest for all users with this filename
-            print(f"Would ingest PDF '{filename}' for all users")
-            print("⚠️  This feature requires additional implementation")
-        
-        input("\nPress Enter to continue...")
-    
-    def remove_pdf_by_filename(self):
-        """Remove PDF data by filename"""
-        print("\n--- Remove PDF by Filename ---")
-        filename = input("Filename: ").strip()
-        user_id = input("User ID (leave empty for all): ").strip() or None
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        try:
-            if user_id:
-                cursor.execute("""
-                    SELECT document_id FROM documents 
-                    WHERE filename = %s AND user_id = %s
-                """, (filename, user_id))
-            else:
-                cursor.execute("""
-                    SELECT document_id FROM documents WHERE filename = %s
-                """, (filename,))
-            
-            docs = cursor.fetchall()
-            
-            if not docs:
-                print("No documents found with that filename")
-                input("\nPress Enter to continue...")
-                return
-            
-            print(f"Found {len(docs)} document(s) with filename '{filename}'")
-            
-            confirm = input("Remove vector data for these documents? (y/n): ").strip().lower()
-            
-            if confirm == 'y':
-                deleted_count = 0
-                for doc in docs:
-                    cursor.execute("""
-                        DELETE FROM document_chunks WHERE document_id = %s
-                    """, (doc[0],))
-                    deleted_count += 1
-                
-                conn.commit()
-                print(f"✅ Removed vector data for {deleted_count} document(s)")
-            else:
-                print("Cancelled")
-        
-        finally:
-            cursor.close()
-            conn.close()
-        
-        input("\nPress Enter to continue...")
-    
-    def remove_pdf_by_user(self):
-        """Remove PDF data by user"""
-        print("\n--- Remove PDF by User ---")
-        user_id = input("User ID: ").strip()
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute("""
-                SELECT COUNT(*) FROM document_chunks WHERE user_id = %s
-            """, (user_id,))
-            
-            count = cursor.fetchone()[0]
-            
-            if count == 0:
-                print("No vector data found for this user")
-                input("\nPress Enter to continue...")
-                return
-            
-            confirm = input(f"Remove {count} vector chunks for user {user_id}? (y/n): ").strip().lower()
-            
-            if confirm == 'y':
-                cursor.execute("""
-                    DELETE FROM document_chunks WHERE user_id = %s
-                """, (user_id,))
-                conn.commit()
-                print(f"✅ Removed {count} vector chunks")
-            else:
-                print("Cancelled")
-        
-        finally:
-            cursor.close()
-            conn.close()
-        
-        input("\nPress Enter to continue...")
-    
-    def list_pdf_data(self):
-        """List PDF data in vector store"""
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute("""
-                SELECT COUNT(*) as total_chunks,
-                       COUNT(DISTINCT document_id) as unique_documents,
-                       COUNT(DISTINCT user_id) as unique_users
-                FROM document_chunks
-            """)
-            
-            stats = cursor.fetchone()
-            
-            print("\n--- Vector Database Statistics ---")
-            print(f"Total chunks: {stats[0]}")
-            print(f"Unique documents: {stats[1]}")
-            print(f"Unique users: {stats[2]}")
-            
-            cursor.execute("""
-                SELECT u.username, COUNT(dc.chunk_id) as chunk_count
-                FROM document_chunks dc
-                JOIN users u ON dc.user_id = u.user_id
-                GROUP BY u.username
-                ORDER BY chunk_count DESC
-                LIMIT 10
-            """)
-            
-            print("\nTop 10 users by chunk count:")
-            print("-"*40)
-            for row in cursor.fetchall():
-                print(f"{row[0]:<20} {row[1]} chunks")
-        
-        finally:
-            cursor.close()
-            conn.close()
-        
-        input("\nPress Enter to continue...")
-    
-    def clear_all_memory(self):
-        """Clear all memory"""
-        print("\n--- Clear All Memory ---")
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute("SELECT COUNT(*) FROM document_chunks")
-            count = cursor.fetchone()[0]
-            
-            if count == 0:
-                print("No vector data to clear")
-                input("\nPress Enter to continue...")
-                return
-            
-            confirm = input(f"WARNING: This will delete ALL {count} vector embeddings! Continue? (y/n): ").strip().lower()
-            
-            if confirm == 'y':
-                cursor.execute("TRUNCATE TABLE document_chunks RESTART IDENTITY CASCADE")
-                conn.commit()
-                print("✅ All vector data cleared")
-            else:
-                print("Cancelled")
-        
-        finally:
-            cursor.close()
-            conn.close()
-        
-        input("\nPress Enter to continue...")
-    
-    def clear_user_memory(self):
-        """Clear user memory"""
-        print("\n--- Clear User Memory ---")
-        user_id = input("User ID: ").strip()
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute("""
-                SELECT COUNT(*) FROM document_chunks WHERE user_id = %s
-            """, (user_id,))
-            
-            count = cursor.fetchone()[0]
-            
-            if count == 0:
-                print("No vector data found for this user")
-                input("\nPress Enter to continue...")
-                return
-            
-            confirm = input(f"Clear {count} vector chunks for user {user_id}? (y/n): ").strip().lower()
-            
-            if confirm == 'y':
-                cursor.execute("""
-                    DELETE FROM document_chunks WHERE user_id = %s
-                """, (user_id,))
-                conn.commit()
-                print(f"✅ Cleared {count} vector chunks")
-            else:
-                print("Cancelled")
-        
-        finally:
-            cursor.close()
-            conn.close()
-        
-        input("\nPress Enter to continue...")
+    # ... (Keep the existing vectordb methods as they are, they use direct database access)
     
     def system_status(self):
         """Display system status"""
         print("\n--- System Status ---")
         
         # Check backend health
-        health_response = self.api_call("/health")
+        health_response = self.api_call("/health", require_auth=False)
         if health_response:
             print("✅ Backend: Healthy")
             print(f"   Database: {health_response.get('database', 'unknown')}")
@@ -1256,6 +1050,60 @@ class CLIInterface:
         
         input("\nPress Enter to continue...")
     
+    def user_profile(self):
+        """Display user profile"""
+        print("\n--- User Profile ---")
+        
+        response = self.api_call("/auth/me")
+        
+        if response:
+            print(f"User ID: {response.get('user_id')}")
+            print(f"Username: {response.get('username')}")
+            print(f"Email: {response.get('email')}")
+            print(f"Role: {'Admin' if response.get('is_admin') else 'User'}")
+            print(f"Document Limit: {'Unlimited' if response.get('max_documents') in [0, -1] else response.get('max_documents')}")
+            print(f"Account Created: {response.get('created_at', 'N/A')}")
+            
+            # Change password option
+            print("\n1. Change Password")
+            print("0. Back")
+            
+            choice = input("\nSelect option: ").strip()
+            
+            if choice == "1":
+                self.change_password()
+        else:
+            print("❌ Failed to load profile")
+        
+        input("\nPress Enter to continue...")
+    
+    def change_password(self):
+        """Change user password"""
+        print("\n--- Change Password ---")
+        
+        current_password = getpass.getpass("Current Password: ")
+        new_password = getpass.getpass("New Password: ")
+        confirm_password = getpass.getpass("Confirm New Password: ")
+        
+        if new_password != confirm_password:
+            print("❌ New passwords don't match!")
+            input("Press Enter to continue...")
+            return
+        
+        data = {
+            "current_password": current_password,
+            "new_password": new_password
+        }
+        
+        response = self.api_call("/auth/change-password", method="POST", data=data)
+        
+        if response:
+            print("✅ Password changed successfully!")
+        else:
+            print("❌ Failed to change password")
+        
+        input("\nPress Enter to continue...")
+    
     def display_user_main_menu(self):
         """User main menu"""
         while True:
@@ -1264,16 +1112,10 @@ class CLIInterface:
             print("1. Upload PDFs")
             print("2. Upload all PDFs from folder")
             print("3. List my PDFs")
-            print("4. Ingest a PDF")
-            print("5. Ingest all my PDFs")
-            print("6. List my ingested PDFs")
-            print("7. Delete a PDF from storage")
-            print("8. Delete all my PDFs from storage")
-            print("9. Remove a PDF from vectordb")
-            print("10. Remove all my PDFs from vectordb")
-            print("11. Chat with documents")
-            print("12. View my chat history")
-            print("13. Check my PDF count")
+            print("4. Chat with documents")
+            print("5. View my chat history")
+            print("6. Check my PDF count")
+            print("7. My Profile")
             print("0. Logout")
             print("="*60)
             
@@ -1286,25 +1128,13 @@ class CLIInterface:
             elif choice == "3":
                 self.user_list_my_pdfs()
             elif choice == "4":
-                self.user_ingest_pdf()
-            elif choice == "5":
-                self.user_ingest_all_pdfs()
-            elif choice == "6":
-                self.user_list_ingested_pdfs()
-            elif choice == "7":
-                self.user_delete_pdf()
-            elif choice == "8":
-                self.user_delete_all_pdfs()
-            elif choice == "9":
-                self.user_remove_pdf_vectordb()
-            elif choice == "10":
-                self.user_remove_all_pdfs_vectordb()
-            elif choice == "11":
                 self.user_chat()
-            elif choice == "12":
+            elif choice == "5":
                 self.user_view_chat_history()
-            elif choice == "13":
+            elif choice == "6":
                 self.user_check_pdf_count()
+            elif choice == "7":
+                self.user_profile()
             elif choice == "0":
                 self.logout()
                 return
@@ -1316,12 +1146,12 @@ class CLIInterface:
         print("\n--- Upload PDFs ---")
         
         # Check PDF count first with proper limit
-        count_response = self.api_call(f"/pdf/user/{self.current_user_id}/count")
-        if count_response:
-            can_upload_more = count_response.get("can_upload_more", True)
-            pdf_count = count_response.get("pdf_count", 0)
-            max_allowed = count_response.get("max_allowed", 5)
-            user_max_docs = count_response.get("user_max_documents", 5)
+        response = self.api_call("/pdf/user/count")
+        if response:
+            can_upload_more = response.get("can_upload_more", True)
+            pdf_count = response.get("pdf_count", 0)
+            max_allowed = response.get("max_allowed", 5)
+            user_max_docs = response.get("user_max_documents", 5)
             
             if not can_upload_more and max_allowed != "unlimited":
                 print(f"❌ You already have {pdf_count} PDFs (max: {max_allowed})")
@@ -1337,10 +1167,10 @@ class CLIInterface:
             return
         
         # Check PDF count again before upload
-        count_response = self.api_call(f"/pdf/user/{self.current_user_id}/count")
-        if count_response:
-            can_upload_more = count_response.get("can_upload_more", True)
-            max_allowed = count_response.get("max_allowed", 5)
+        response = self.api_call("/pdf/user/count")
+        if response:
+            can_upload_more = response.get("can_upload_more", True)
+            max_allowed = response.get("max_allowed", 5)
             
             if not can_upload_more and max_allowed != "unlimited":
                 print(f"❌ You reached your limit of {max_allowed} PDFs!")
@@ -1350,37 +1180,40 @@ class CLIInterface:
         print(f"\nUploading {file_path}...")
         print("Note: Your documents are always private (only you can access them)")
         
-        with open(file_path, 'rb') as f:
-            files = {"file": (os.path.basename(file_path), f, "application/pdf")}
-            data = {
-                "is_public": "false",  # Always false for regular users
-                "admin_upload": "false"  # Not an admin upload
-            }
-            
-            response = self.api_call(
-                f"/pdf/upload/{self.current_user_id}",
-                method="POST",
-                files=files,
-                data=data
-            )
-            
-            if response:
-                print("✅ Upload successful!")
-                print(f"Document ID: {response.get('document_id')}")
-                print(f"Chunks created: {response.get('chunks_created')}")
-                print(f"Chunk size: {response.get('chunk_settings', {}).get('chunk_size', 300)}")
-                print(f"Chunk overlap: {response.get('chunk_settings', {}).get('chunk_overlap', 30)}")
+        try:
+            with open(file_path, 'rb') as f:
+                files = {"file": (os.path.basename(file_path), f, "application/pdf")}
+                data = {
+                    "is_public": "false",
+                    "admin_upload": "false"
+                }
                 
-                # Get updated count
-                count_response = self.api_call(f"/pdf/user/{self.current_user_id}/count")
-                if count_response:
-                    new_count = count_response.get("pdf_count", 0)
-                    max_allowed = count_response.get("max_allowed", 5)
-                    print(f"You now have {new_count} PDFs (limit: {max_allowed})")
+                response = self.api_call(
+                    "/pdf/upload",
+                    method="POST",
+                    files=files,
+                    data=data
+                )
                 
-                print("🔒 Document is PRIVATE (only you can access)")
-            else:
-                print("❌ Upload failed!")
+                if response:
+                    print("✅ Upload successful!")
+                    print(f"Document ID: {response.get('document_id')}")
+                    print(f"Chunks created: {response.get('chunks_created')}")
+                    print(f"Chunk size: {response.get('chunk_settings', {}).get('chunk_size', 300)}")
+                    print(f"Chunk overlap: {response.get('chunk_settings', {}).get('chunk_overlap', 30)}")
+                    
+                    # Get updated count
+                    response = self.api_call("/pdf/user/count")
+                    if response:
+                        new_count = response.get("pdf_count", 0)
+                        max_allowed = response.get("max_allowed", 5)
+                        print(f"You now have {new_count} PDFs (limit: {max_allowed})")
+                    
+                    print("🔒 Document is PRIVATE (only you can access)")
+                else:
+                    print("❌ Upload failed!")
+        except Exception as e:
+            print(f"❌ Upload error: {str(e)}")
         
         input("\nPress Enter to continue...")
     
@@ -1395,11 +1228,11 @@ class CLIInterface:
             return
         
         # Check PDF count first
-        count_response = self.api_call(f"/pdf/user/{self.current_user_id}/count")
-        if count_response:
-            can_upload_more = count_response.get("can_upload_more", True)
-            pdf_count = count_response.get("pdf_count", 0)
-            max_allowed = count_response.get("max_allowed", 5)
+        response = self.api_call("/pdf/user/count")
+        if response:
+            can_upload_more = response.get("can_upload_more", True)
+            pdf_count = response.get("pdf_count", 0)
+            max_allowed = response.get("max_allowed", 5)
             
             if not can_upload_more and max_allowed != "unlimited":
                 print(f"❌ You already have {pdf_count} PDFs (max: {max_allowed})")
@@ -1420,10 +1253,10 @@ class CLIInterface:
         uploaded_count = 0
         for pdf_file in pdf_files:
             # Check if user can upload more
-            count_response = self.api_call(f"/pdf/user/{self.current_user_id}/count")
-            if count_response:
-                can_upload_more = count_response.get("can_upload_more", True)
-                max_allowed = count_response.get("max_allowed", 5)
+            response = self.api_call("/pdf/user/count")
+            if response:
+                can_upload_more = response.get("can_upload_more", True)
+                max_allowed = response.get("max_allowed", 5)
                 
                 if not can_upload_more and max_allowed != "unlimited":
                     print(f"\n⚠️  You reached your limit of {max_allowed} PDFs. Stopping upload.")
@@ -1431,40 +1264,43 @@ class CLIInterface:
             
             print(f"\nUploading: {os.path.basename(pdf_file)}")
             
-            with open(pdf_file, 'rb') as f:
-                files = {"file": (os.path.basename(pdf_file), f, "application/pdf")}
-                data = {
-                    "is_public": "false",  # Always false for regular users
-                    "admin_upload": "false"  # Not an admin upload
-                }
-                
-                response = self.api_call(
-                    f"/pdf/upload/{self.current_user_id}",
-                    method="POST",
-                    files=files,
-                    data=data
-                )
-                
-                if response:
-                    print(f"  ✅ Success! (Chunks: {response.get('chunks_created')}, PRIVATE)")
-                    uploaded_count += 1
-                else:
-                    print(f"  ❌ Failed!")
+            try:
+                with open(pdf_file, 'rb') as f:
+                    files = {"file": (os.path.basename(pdf_file), f, "application/pdf")}
+                    data = {
+                        "is_public": "false",
+                        "admin_upload": "false"
+                    }
+                    
+                    response = self.api_call(
+                        "/pdf/upload",
+                        method="POST",
+                        files=files,
+                        data=data
+                    )
+                    
+                    if response:
+                        print(f"  ✅ Success! (Chunks: {response.get('chunks_created')}, PRIVATE)")
+                        uploaded_count += 1
+                    else:
+                        print(f"  ❌ Failed!")
+            except Exception as e:
+                print(f"  ❌ Error: {str(e)}")
         
         print(f"\n✅ Uploaded {uploaded_count} out of {len(pdf_files)} PDFs")
         
         # Show final count
-        count_response = self.api_call(f"/pdf/user/{self.current_user_id}/count")
-        if count_response:
-            new_count = count_response.get("pdf_count", 0)
-            max_allowed = count_response.get("max_allowed", 5)
+        response = self.api_call("/pdf/user/count")
+        if response:
+            new_count = response.get("pdf_count", 0)
+            max_allowed = response.get("max_allowed", 5)
             print(f"You now have {new_count} PDFs (limit: {max_allowed})")
         
         input("\nPress Enter to continue...")
     
     def user_list_my_pdfs(self):
         """User list their PDFs"""
-        response = self.api_call(f"/pdf/user/{self.current_user_id}/documents")
+        response = self.api_call("/pdf/user/documents")
         
         if response:
             documents = response.get("documents", [])
@@ -1493,221 +1329,16 @@ class CLIInterface:
         
         input("\nPress Enter to continue...")
     
-    def user_ingest_pdf(self):
-        """User ingest PDF"""
-        print("\n--- Ingest PDF ---")
-        document_id = input("Document ID: ").strip()
-        
-        # Note: PDFs are automatically ingested on upload
-        print("⚠️  PDFs are automatically ingested on upload")
-        print("Current chunk settings:")
-        print("  - Chunk size: 300 characters")
-        print("  - Chunk overlap: 30 characters")
-        print("This feature would re-process the PDF if needed")
-        
-        input("\nPress Enter to continue...")
-    
-    def user_ingest_all_pdfs(self):
-        """User ingest all PDFs"""
-        print("\n--- Ingest All My PDFs ---")
-        
-        # Note: PDFs are automatically ingested on upload
-        print("⚠️  PDFs are automatically ingested on upload")
-        print("Current chunk settings:")
-        print("  - Chunk size: 300 characters")
-        print("  - Chunk overlap: 30 characters")
-        print("This feature would re-process all your PDFs")
-        
-        input("\nPress Enter to continue...")
-    
-    def user_list_ingested_pdfs(self):
-        """User list ingested PDFs"""
-        # Same as list my PDFs
-        self.user_list_my_pdfs()
-    
-    def user_delete_pdf(self):
-        """User delete PDF"""
-        print("\n--- Delete PDF ---")
-        document_id = input("Document ID: ").strip()
-        
-        # First check if document belongs to user
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute("""
-                SELECT filename FROM documents 
-                WHERE document_id = %s AND user_id = %s
-            """, (document_id, self.current_user_id))
-            
-            result = cursor.fetchone()
-            
-            if not result:
-                print("❌ Document not found or you don't have permission to delete it")
-                input("\nPress Enter to continue...")
-                return
-            
-            filename = result[0]
-            
-            confirm = input(f"Delete document '{filename}'? (y/n): ").strip().lower()
-            
-            if confirm == 'y':
-                response = self.api_call(f"/pdf/delete/{document_id}", method="DELETE")
-                if response:
-                    print("✅ Document deleted successfully!")
-                else:
-                    print("❌ Failed to delete document")
-        
-        finally:
-            cursor.close()
-            conn.close()
-        
-        input("\nPress Enter to continue...")
-    
-    def user_delete_all_pdfs(self):
-        """User delete all PDFs"""
-        print("\n--- Delete All My PDFs ---")
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute("""
-                SELECT document_id, filename FROM documents 
-                WHERE user_id = %s
-            """, (self.current_user_id,))
-            
-            docs = cursor.fetchall()
-            
-            if not docs:
-                print("No documents found.")
-                input("\nPress Enter to continue...")
-                return
-            
-            print(f"Found {len(docs)} documents:")
-            for doc_id, filename in docs:
-                print(f"  - {filename}")
-            
-            confirm = input(f"\nDelete ALL {len(docs)} documents? (y/n): ").strip().lower()
-            
-            if confirm == 'y':
-                deleted_count = 0
-                for doc_id, filename in docs:
-                    response = self.api_call(f"/pdf/delete/{doc_id}", method="DELETE")
-                    if response:
-                        deleted_count += 1
-                        print(f"Deleted: {filename}")
-                
-                print(f"\n✅ Deleted {deleted_count} out of {len(docs)} documents")
-            else:
-                print("Cancelled")
-        
-        finally:
-            cursor.close()
-            conn.close()
-        
-        input("\nPress Enter to continue...")
-    
-    def user_remove_pdf_vectordb(self):
-        """User remove PDF from vector DB"""
-        print("\n--- Remove PDF from VectorDB ---")
-        document_id = input("Document ID: ").strip()
-        
-        # First check if document belongs to user
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute("""
-                SELECT filename FROM documents 
-                WHERE document_id = %s AND user_id = %s
-            """, (document_id, self.current_user_id))
-            
-            result = cursor.fetchone()
-            
-            if not result:
-                print("❌ Document not found or you don't have permission")
-                input("\nPress Enter to continue...")
-                return
-            
-            filename = result[0]
-            
-            # Count vector chunks for this document
-            cursor.execute("""
-                SELECT COUNT(*) FROM document_chunks 
-                WHERE document_id = %s AND user_id = %s
-            """, (document_id, self.current_user_id))
-            
-            chunk_count = cursor.fetchone()[0]
-            
-            if chunk_count == 0:
-                print("No vector data found for this document")
-                input("\nPress Enter to continue...")
-                return
-            
-            confirm = input(f"Remove {chunk_count} vector chunks for '{filename}'? (y/n): ").strip().lower()
-            
-            if confirm == 'y':
-                cursor.execute("""
-                    DELETE FROM document_chunks 
-                    WHERE document_id = %s AND user_id = %s
-                """, (document_id, self.current_user_id))
-                conn.commit()
-                print(f"✅ Removed {chunk_count} vector chunks")
-            else:
-                print("Cancelled")
-        
-        finally:
-            cursor.close()
-            conn.close()
-        
-        input("\nPress Enter to continue...")
-    
-    def user_remove_all_pdfs_vectordb(self):
-        """User remove all PDFs from vector DB"""
-        print("\n--- Remove All My PDFs from VectorDB ---")
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute("""
-                SELECT COUNT(*) FROM document_chunks 
-                WHERE user_id = %s
-            """, (self.current_user_id,))
-            
-            chunk_count = cursor.fetchone()[0]
-            
-            if chunk_count == 0:
-                print("No vector data found")
-                input("\nPress Enter to continue...")
-                return
-            
-            confirm = input(f"Remove ALL {chunk_count} vector chunks? (y/n): ").strip().lower()
-            
-            if confirm == 'y':
-                cursor.execute("""
-                    DELETE FROM document_chunks WHERE user_id = %s
-                """, (self.current_user_id,))
-                conn.commit()
-                print(f"✅ Removed {chunk_count} vector chunks")
-            else:
-                print("Cancelled")
-        
-        finally:
-            cursor.close()
-            conn.close()
-        
-        input("\nPress Enter to continue...")
-    
     def user_chat(self):
         """User chat interface"""
         print("\n" + "="*60)
         print("CHAT WITH YOUR DOCUMENTS")
         print("Type 'quit' to exit, 'public on/off' to toggle public docs")
+        print("Type 'chunks' after a response to see chunks used")
         print("="*60)
         
         use_public = True
+        last_response = None
         
         while True:
             question = input("\nYou: ").strip()
@@ -1729,12 +1360,12 @@ class CLIInterface:
             print("Thinking...")
             
             data = {
-                "user_id": self.current_user_id,
                 "question": question,
                 "use_public_data": use_public
             }
             
             response = self.api_call("/chat/ask", method="POST", data=data)
+            last_response = response
             
             if response:
                 answer = response.get("answer", "No response")
@@ -1743,6 +1374,14 @@ class CLIInterface:
                 budget = response.get("budget_status", {})
                 if budget:
                     print(f"   Budget used: ${budget.get('used_budget', 0):.4f}")
+                
+                # Show chunks if requested
+                if question.lower() == 'chunks' and last_response:
+                    if last_response.get("chunks_used", 0) > 0:
+                        print(f"\n📚 Chunks used ({last_response.get('chunks_used', 0)}):")
+                        for i, chunk in enumerate(last_response.get("chunks", [])):
+                            print(f"\nChunk {i+1} (similarity: {chunk.get('similarity_score', 0):.3f}):")
+                            print(f"  {chunk.get('content_preview', 'No content')}")
             else:
                 print("❌ Failed to get response.")
     
@@ -1782,7 +1421,7 @@ class CLIInterface:
     
     def user_check_pdf_count(self):
         """User check their PDF count"""
-        response = self.api_call(f"/pdf/user/{self.current_user_id}/count")
+        response = self.api_call("/pdf/user/count")
         
         if response:
             count = response.get("pdf_count", 0)
@@ -1811,8 +1450,9 @@ class CLIInterface:
         self.current_user_id = None
         self.current_username = None
         self.is_admin = False
-        self.token = None
-        self.admin_token = None
+        self.access_token = None
+        self.refresh_token = None
+        self.token_expiry = None
         print("\n✅ Logged out successfully!")
     
     def run(self):
