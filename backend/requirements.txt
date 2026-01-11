@@ -29,3 +29,5 @@ langchain-text-splitters==0.0.1
 # Pydantic
 pydantic==2.5.0
 pydantic-settings==2.1.0
+
+locust
