@@ -1,8 +1,8 @@
-# backend/cli_interface.py - Updated with JWT Authentication
+# backend/cli_interface.py - COMPLETE VERSION with JWT Authentication
 import sys
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import getpass
 from typing import Dict, Any
 import requests
@@ -49,9 +49,9 @@ class CLIInterface:
             # Check token expiry and refresh if needed
             if require_auth and self.token_expiry:
                 if datetime.now() > self.token_expiry:
-                    self.refresh_access_token()
-                    if self.access_token:
-                        request_headers["Authorization"] = f"Bearer {self.access_token}"
+                    if not self.refresh_access_token():
+                        print("❌ Session expired. Please login again.")
+                        return None
             
             if method == "GET":
                 response = requests.get(url, headers=request_headers)
@@ -108,15 +108,16 @@ class CLIInterface:
         
         try:
             data = {"refresh_token": self.refresh_token}
-            response = self.api_call("/auth/refresh", method="POST", data=data, require_auth=False)
+            response = requests.post(f"{self.backend_url}/auth/refresh", json=data)
             
-            if response and not response.get("error"):
-                self.access_token = response.get("access_token")
-                self.token_expiry = datetime.now()  # Reset expiry
-                print("✅ Access token refreshed")
+            if response.status_code == 200:
+                result = response.json()
+                self.access_token = result.get("access_token")
+                # Set expiry to 25 minutes from now (tokens last 30 minutes)
+                self.token_expiry = datetime.now() + timedelta(minutes=25)
                 return True
             else:
-                print("❌ Failed to refresh token")
+                print("❌ Failed to refresh token. Please login again.")
                 return False
         except Exception as e:
             print(f"❌ Token refresh error: {str(e)}")
@@ -139,7 +140,7 @@ class CLIInterface:
             self.is_admin = response.get("is_admin", False)
             self.access_token = response.get("access_token")
             self.refresh_token = response.get("refresh_token")
-            self.token_expiry = datetime.now()  # Will refresh as needed
+            self.token_expiry = datetime.now() + timedelta(minutes=25)  # 25 minutes for 30-min token
             
             print(f"\n✅ Welcome {username}!")
             print(f"   Role: {'Admin' if self.is_admin else 'User'}")
@@ -167,7 +168,7 @@ class CLIInterface:
                 self.is_admin = True
                 self.access_token = response.get("access_token")
                 self.refresh_token = response.get("refresh_token")
-                self.token_expiry = datetime.now()
+                self.token_expiry = datetime.now() + timedelta(minutes=25)
                 
                 print(f"\n✅ Admin login successful!")
                 print(f"   Welcome, {username}!")
@@ -977,7 +978,274 @@ class CLIInterface:
             else:
                 input("\n❌ Invalid option. Press Enter to continue...")
     
-    # ... (Keep the existing vectordb methods as they are, they use direct database access)
+    def ingest_all_public_pdfs(self):
+        """Ingest all public PDFs (re-process)"""
+        print("\n--- Ingest All Public PDFs ---")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("""
+                SELECT document_id, filename, user_id FROM documents WHERE is_public = true
+            """)
+            
+            public_docs = cursor.fetchall()
+            
+            if not public_docs:
+                print("No public PDFs found.")
+                input("\nPress Enter to continue...")
+                return
+            
+            print(f"Found {len(public_docs)} public PDFs to re-ingest")
+            confirm = input("Continue? (y/n): ").strip().lower()
+            
+            if confirm != 'y':
+                print("Cancelled")
+                input("\nPress Enter to continue...")
+                return
+            
+            print("⚠️  Re-ingestion endpoint not implemented yet")
+            print("PDFs are automatically ingested on upload")
+            print(f"Current chunk size: 300")
+            print(f"Current chunk overlap: 30")
+            
+        finally:
+            cursor.close()
+            conn.close()
+        
+        input("\nPress Enter to continue...")
+    
+    def ingest_pdf_by_filename(self):
+        """Ingest PDF by filename"""
+        print("\n--- Ingest PDF by Filename ---")
+        filename = input("Filename: ").strip()
+        user_id = input("User ID (leave empty for all users): ").strip() or None
+        
+        if user_id:
+            # Ingest for specific user
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            try:
+                cursor.execute("""
+                    SELECT document_id FROM documents 
+                    WHERE filename = %s AND user_id = %s
+                """, (filename, user_id))
+                
+                doc = cursor.fetchone()
+                
+                if doc:
+                    print(f"Found document: {doc[0]}")
+                    print("⚠️  Re-ingestion endpoint not implemented yet")
+                    print("PDFs are automatically ingested on upload")
+                else:
+                    print("Document not found for this user")
+            
+            finally:
+                cursor.close()
+                conn.close()
+        else:
+            # Ingest for all users with this filename
+            print(f"Would ingest PDF '{filename}' for all users")
+            print("⚠️  This feature requires additional implementation")
+        
+        input("\nPress Enter to continue...")
+    
+    def remove_pdf_by_filename(self):
+        """Remove PDF data by filename"""
+        print("\n--- Remove PDF by Filename ---")
+        filename = input("Filename: ").strip()
+        user_id = input("User ID (leave empty for all): ").strip() or None
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            if user_id:
+                cursor.execute("""
+                    SELECT document_id FROM documents 
+                    WHERE filename = %s AND user_id = %s
+                """, (filename, user_id))
+            else:
+                cursor.execute("""
+                    SELECT document_id FROM documents WHERE filename = %s
+                """, (filename,))
+            
+            docs = cursor.fetchall()
+            
+            if not docs:
+                print("No documents found with that filename")
+                input("\nPress Enter to continue...")
+                return
+            
+            print(f"Found {len(docs)} document(s) with filename '{filename}'")
+            
+            confirm = input("Remove vector data for these documents? (y/n): ").strip().lower()
+            
+            if confirm == 'y':
+                deleted_count = 0
+                for doc in docs:
+                    cursor.execute("""
+                        DELETE FROM document_chunks WHERE document_id = %s
+                    """, (doc[0],))
+                    deleted_count += 1
+                
+                conn.commit()
+                print(f"✅ Removed vector data for {deleted_count} document(s)")
+            else:
+                print("Cancelled")
+        
+        finally:
+            cursor.close()
+            conn.close()
+        
+        input("\nPress Enter to continue...")
+    
+    def remove_pdf_by_user(self):
+        """Remove PDF data by user"""
+        print("\n--- Remove PDF by User ---")
+        user_id = input("User ID: ").strip()
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("""
+                SELECT COUNT(*) FROM document_chunks WHERE user_id = %s
+            """, (user_id,))
+            
+            count = cursor.fetchone()[0]
+            
+            if count == 0:
+                print("No vector data found for this user")
+                input("\nPress Enter to continue...")
+                return
+            
+            confirm = input(f"Remove {count} vector chunks for user {user_id}? (y/n): ").strip().lower()
+            
+            if confirm == 'y':
+                cursor.execute("""
+                    DELETE FROM document_chunks WHERE user_id = %s
+                """, (user_id,))
+                conn.commit()
+                print(f"✅ Removed {count} vector chunks")
+            else:
+                print("Cancelled")
+        
+        finally:
+            cursor.close()
+            conn.close()
+        
+        input("\nPress Enter to continue...")
+    
+    def list_pdf_data(self):
+        """List PDF data in vector store"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("""
+                SELECT COUNT(*) as total_chunks,
+                       COUNT(DISTINCT document_id) as unique_documents,
+                       COUNT(DISTINCT user_id) as unique_users
+                FROM document_chunks
+            """)
+            
+            stats = cursor.fetchone()
+            
+            print("\n--- Vector Database Statistics ---")
+            print(f"Total chunks: {stats[0]}")
+            print(f"Unique documents: {stats[1]}")
+            print(f"Unique users: {stats[2]}")
+            
+            cursor.execute("""
+                SELECT u.username, COUNT(dc.chunk_id) as chunk_count
+                FROM document_chunks dc
+                JOIN users u ON dc.user_id = u.user_id
+                GROUP BY u.username
+                ORDER BY chunk_count DESC
+                LIMIT 10
+            """)
+            
+            print("\nTop 10 users by chunk count:")
+            print("-"*40)
+            for row in cursor.fetchall():
+                print(f"{row[0]:<20} {row[1]} chunks")
+        
+        finally:
+            cursor.close()
+            conn.close()
+        
+        input("\nPress Enter to continue...")
+    
+    def clear_all_memory(self):
+        """Clear all memory"""
+        print("\n--- Clear All Memory ---")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("SELECT COUNT(*) FROM document_chunks")
+            count = cursor.fetchone()[0]
+            
+            if count == 0:
+                print("No vector data to clear")
+                input("\nPress Enter to continue...")
+                return
+            
+            confirm = input(f"WARNING: This will delete ALL {count} vector embeddings! Continue? (y/n): ").strip().lower()
+            
+            if confirm == 'y':
+                cursor.execute("TRUNCATE TABLE document_chunks RESTART IDENTITY CASCADE")
+                conn.commit()
+                print("✅ All vector data cleared")
+            else:
+                print("Cancelled")
+        
+        finally:
+            cursor.close()
+            conn.close()
+        
+        input("\nPress Enter to continue...")
+    
+    def clear_user_memory(self):
+        """Clear user memory"""
+        print("\n--- Clear User Memory ---")
+        user_id = input("User ID: ").strip()
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("""
+                SELECT COUNT(*) FROM document_chunks WHERE user_id = %s
+            """, (user_id,))
+            
+            count = cursor.fetchone()[0]
+            
+            if count == 0:
+                print("No vector data found for this user")
+                input("\nPress Enter to continue...")
+                return
+            
+            confirm = input(f"Clear {count} vector chunks for user {user_id}? (y/n): ").strip().lower()
+            
+            if confirm == 'y':
+                cursor.execute("""
+                    DELETE FROM document_chunks WHERE user_id = %s
+                """, (user_id,))
+                conn.commit()
+                print(f"✅ Cleared {count} vector chunks")
+            else:
+                print("Cancelled")
+        
+        finally:
+            cursor.close()
+            conn.close()
+        
+        input("\nPress Enter to continue...")
     
     def system_status(self):
         """Display system status"""
