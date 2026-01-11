@@ -12,7 +12,7 @@ import uuid
 from shared_dependencies import chat_client, budget_tracker, create_embedding
 
 # Import security
-from security import get_current_active_user, TokenData
+from security import get_current_active_user, TokenData, , require_admin
 
 router = APIRouter(prefix="/chat", tags=["rag engine"])
 
