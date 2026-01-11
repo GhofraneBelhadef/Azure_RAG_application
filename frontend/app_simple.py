@@ -1,4 +1,4 @@
-# frontend/app_simple.py - Updated for admin-controlled registration and document limits
+# frontend/app_simple.py - Updated for admin-controlled registration, document limits, and chunk display (FIXED DUPLICATE REQUEST)
 import streamlit as st
 import requests
 import json
@@ -29,6 +29,16 @@ def init_session_state():
         st.session_state.confirm_delete = None
     if 'user_max_documents' not in st.session_state:
         st.session_state.user_max_documents = 5
+    if 'registration_message' not in st.session_state:
+        st.session_state.registration_message = None
+    if 'expanded_chunks' not in st.session_state:
+        st.session_state.expanded_chunks = {}
+    if 'expanded_full_chunks' not in st.session_state:
+        st.session_state.expanded_full_chunks = {}
+    if 'processing_question' not in st.session_state:
+        st.session_state.processing_question = None
+    if 'last_processed_question' not in st.session_state:
+        st.session_state.last_processed_question = None
 
 init_session_state()
 
@@ -52,21 +62,31 @@ def api_call(endpoint, method="GET", data=None, files=None):
         if response.status_code == 200:
             return response.json()
         else:
-            # Try to parse error message
-            try:
-                error_data = response.json()
-                error_msg = error_data.get("detail", response.text)
-            except:
-                error_msg = response.text
-            st.error(f"Error {response.status_code}: {error_msg}")
-            return None
+            # Return the full response for error handling
+            return {
+                "status_code": response.status_code,
+                "error": True,
+                "detail": response.json() if response.text else {"detail": f"HTTP {response.status_code}"}
+            }
     except Exception as e:
-        st.error(f"Connection error: {str(e)}")
-        return None
+        return {
+            "status_code": 0,
+            "error": True,
+            "detail": {"detail": f"Connection error: {str(e)}"}
+        }
 
 # Login Page
 def login_page():
     st.title("🔐 Azure RAG Chatbot Login")
+    
+    # Show registration message if available
+    if st.session_state.registration_message:
+        if st.session_state.registration_message.get("success"):
+            st.success(st.session_state.registration_message["message"])
+        else:
+            st.error(st.session_state.registration_message["message"])
+        # Clear the message after showing it
+        st.session_state.registration_message = None
     
     tab1, tab2 = st.tabs(["Login", "Complete Registration"])
     
@@ -81,7 +101,7 @@ def login_page():
                 data = {"username": username, "password": password}
                 response = api_call("/auth/login", method="POST", data=data)
                 
-                if response:
+                if response and not response.get("error"):
                     st.session_state.logged_in = True
                     st.session_state.user_id = response.get("user_id")
                     st.session_state.username = username
@@ -89,12 +109,14 @@ def login_page():
                     
                     # Get user's document limit
                     reg_response = api_call(f"/auth/check-registration/{username}")
-                    if reg_response:
+                    if reg_response and not reg_response.get("error"):
                         st.session_state.user_max_documents = reg_response.get("max_documents", 5)
                     
                     st.success(f"Welcome {username}! ({'Admin' if st.session_state.is_admin else 'User'})")
                     time.sleep(1)
                     st.rerun()
+                elif response and response.get("error"):
+                    st.error(f"Login failed: {response.get('detail', {}).get('detail', 'Unknown error')}")
     
     with tab2:
         st.subheader("Complete Registration")
@@ -120,17 +142,43 @@ def login_page():
                         "new_password": new_password
                     }
                     response = api_call("/auth/complete-registration", method="POST", data=data)
+                    
                     if response:
-                        st.success("✅ Registration completed successfully!")
-                        st.info(f"You can now login as **{username}** with your new password.")
-                        # Auto-switch to login tab
-                        st.rerun()
+                        if response.get("error"):
+                            error_detail = response.get('detail', {})
+                            error_message = error_detail.get('detail', 'Registration failed')
+                            
+                            # Check if it's a "user already registered" error
+                            if "already registered" in error_message.lower() or response.get('status_code') == 400:
+                                # This is actually a success case - the user is already registered
+                                st.session_state.registration_message = {
+                                    "success": True,
+                                    "message": f"✅ User '{username}' is already registered! You can now login with your password."
+                                }
+                                st.rerun()
+                            else:
+                                st.error(f"Registration failed: {error_message}")
+                        else:
+                            # Successful registration
+                            st.session_state.registration_message = {
+                                "success": True,
+                                "message": "✅ Registration completed successfully!"
+                            }
+                            st.info(f"You can now login as **{username}** with your new password.")
+                            # Auto-switch to login tab
+                            st.rerun()
                     else:
                         st.error("Registration failed. Please check your temporary password.")
 
-# Chat Interface
+# Chat Interface with Chunk Display (FIXED DUPLICATE REQUEST)
 def chat_page():
     st.title("💬 Chat with Your Documents")
+    
+    # Initialize session state for expanded chunks
+    if 'expanded_chunks' not in st.session_state:
+        st.session_state.expanded_chunks = {}
+    if 'expanded_full_chunks' not in st.session_state:
+        st.session_state.expanded_full_chunks = {}
     
     # Sidebar
     with st.sidebar:
@@ -139,12 +187,16 @@ def chat_page():
         
         if st.button("Clear Chat"):
             st.session_state.chat_history = []
+            st.session_state.expanded_chunks = {}
+            st.session_state.expanded_full_chunks = {}
+            st.session_state.processing_question = None
+            st.session_state.last_processed_question = None
             st.rerun()
         
         # Show PDF count
         if st.session_state.user_id:
             response = api_call(f"/pdf/user/{st.session_state.user_id}/count")
-            if response:
+            if response and not response.get("error"):
                 count = response.get("pdf_count", 0)
                 max_allowed = response.get("max_allowed", 5)
                 if max_allowed == "unlimited":
@@ -158,14 +210,18 @@ def chat_page():
             st.session_state.username = None
             st.session_state.is_admin = False
             st.session_state.chat_history = []
+            st.session_state.expanded_chunks = {}
+            st.session_state.expanded_full_chunks = {}
             st.session_state.confirm_delete = None
             st.session_state.user_max_documents = 5
+            st.session_state.processing_question = None
+            st.session_state.last_processed_question = None
             st.rerun()
         
         # Health check
         if st.button("Check System Health"):
             health = api_call("/health")
-            if health:
+            if health and not health.get("error"):
                 st.success("✅ System is healthy")
                 st.json(health)
     
@@ -174,51 +230,168 @@ def chat_page():
     
     with chat_container:
         # Display chat history
-        for chat in st.session_state.chat_history:
+        for i, chat in enumerate(st.session_state.chat_history):
             if chat["role"] == "user":
                 with st.chat_message("user"):
                     st.write(chat["content"])
             else:
                 with st.chat_message("assistant"):
                     st.write(chat["content"])
-                    if "chunks_used" in chat:
-                        st.caption(f"Used {chat['chunks_used']} document chunks")
+                    
+                    # Display chunks used with expandable sections
+                    if chat.get("chunks_used", 0) > 0:
+                        # Create a container for chunk information
+                        chunk_container = st.container()
+                        
+                        with chunk_container:
+                            # Button to show/hide chunks
+                            col1, col2, col3 = st.columns([2, 1, 1])
+                            with col1:
+                                expand_key = f"show_chunks_{i}"
+                                show_chunks = st.session_state.expanded_chunks.get(expand_key, False)
+                                
+                                if st.button(
+                                    f"{'📖 Hide' if show_chunks else '📖 Show'} chunks used ({chat['chunks_used']})",
+                                    key=expand_key
+                                ):
+                                    st.session_state.expanded_chunks[expand_key] = not show_chunks
+                                    st.rerun()
+                            
+                            # Show chunk details if expanded
+                            if st.session_state.expanded_chunks.get(expand_key, False):
+                                st.markdown("---")
+                                st.subheader("📑 Document Chunks Used")
+                                
+                                # Check if we have chunk details in the response
+                                if chat.get("chunks"):
+                                    for j, chunk in enumerate(chat["chunks"]):
+                                        # Create a unique key for this specific chunk
+                                        chunk_key = f"chunk_{i}_{j}"
+                                        
+                                        # Create expander for each chunk
+                                        with st.expander(
+                                            f"📄 Chunk {j+1} (Similarity: {chunk.get('similarity_score', 0):.3f})",
+                                            expanded=False
+                                        ):
+                                            # Show chunk content preview
+                                            st.markdown("**Content Preview:**")
+                                            preview_text = chunk.get("content_preview", "No content available")
+                                            st.markdown(f"```\n{preview_text}\n```")
+                                            
+                                            # Show source info if available
+                                            if chat.get("sources") and j < len(chat["sources"]):
+                                                source = chat["sources"][j]
+                                                st.markdown("**Source Information:**")
+                                                st.markdown(f"- **File:** {source.get('filename', 'Unknown')}")
+                                                st.markdown(f"- **Uploaded by:** {source.get('uploaded_by', 'Unknown')}")
+                                                
+                                                # Button to view full chunk content
+                                                full_key = f"view_full_{i}_{j}"
+                                                if st.button("📝 View Full Content", key=full_key):
+                                                    # Toggle full content view
+                                                    if full_key not in st.session_state.expanded_full_chunks:
+                                                        st.session_state.expanded_full_chunks[full_key] = True
+                                                    else:
+                                                        st.session_state.expanded_full_chunks[full_key] = not st.session_state.expanded_full_chunks[full_key]
+                                                    st.rerun()
+                                                
+                                                # Show full content if expanded
+                                                if st.session_state.expanded_full_chunks.get(full_key, False):
+                                                    st.markdown("**Full Content:**")
+                                                    full_content = source.get('content', 'No full content available')
+                                                    st.markdown(f"```\n{full_content}\n```")
+                                                    
+                                                    # Add copy button (Streamlit doesn't have native copy, but we can show the text)
+                                                    st.markdown("**Copy this chunk:**")
+                                                    st.code(full_content, language=None)
+                                            else:
+                                                st.info("No source information available.")
+                                                
+                                                # Fallback to basic info
+                                                if chunk.get("document_id"):
+                                                    st.markdown(f"**Document ID:** `{chunk['document_id']}`")
+                                    
+                                    # Add summary of sources used
+                                    st.markdown("---")
+                                    st.subheader("📋 Summary of Sources")
+                                    source_set = set()
+                                    if chat.get("sources"):
+                                        for source in chat["sources"]:
+                                            source_set.add(f"{source.get('filename', 'Unknown')} (by {source.get('uploaded_by', 'Unknown')})")
+                                        
+                                        for source_name in sorted(source_set):
+                                            st.markdown(f"• {source_name}")
+                                else:
+                                    st.info("No detailed chunk information available for this response.")
     
-    # Chat input
-    if prompt := st.chat_input("Ask a question about your documents..."):
-        # Add user message
-        st.session_state.chat_history.append({"role": "user", "content": prompt})
+    # Chat input - FIXED to prevent duplicate requests
+    chat_input_container = st.container()
+    
+    with chat_input_container:
+        if "chat_input" not in st.session_state:
+            st.session_state.chat_input = ""
         
-        # Show user message immediately
-        with st.chat_message("user"):
-            st.write(prompt)
+        question = st.chat_input("Ask a question about your documents...", key="chat_input_widget")
         
-        # Get AI response
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                data = {
-                    "user_id": st.session_state.user_id,
-                    "question": prompt,
-                    "use_public_data": use_public_data
-                }
-                response = api_call("/chat/ask", method="POST", data=data)
+        if question:
+            # Check if this is the same question that's already being processed
+            if (st.session_state.processing_question == question or 
+                st.session_state.last_processed_question == question):
+                # This question is already being processed or was just processed
+                # Skip to avoid duplicate requests
+                pass
+            else:
+                # Store that we're processing this question
+                st.session_state.processing_question = question
                 
-                if response:
-                    answer = response.get("answer", "No response")
-                    st.write(answer)
-                    
-                    # Add to history
-                    st.session_state.chat_history.append({
-                        "role": "assistant",
-                        "content": answer,
-                        "chunks_used": response.get("chunks_used", 0)
-                    })
-                    
-                    # Show budget info
-                    budget = response.get("budget_status", {})
-                    st.sidebar.info(f"💰 Budget used: ${budget.get('used_budget', 0):.4f}")
-                else:
-                    st.error("Failed to get response")
+                # Add user message to chat history
+                st.session_state.chat_history.append({"role": "user", "content": question})
+                
+                # Show user message immediately
+                with st.chat_message("user"):
+                    st.write(question)
+                
+                # Clear the processing flag and mark as last processed
+                st.session_state.processing_question = None
+                st.session_state.last_processed_question = question
+                
+                # Get AI response
+                with st.chat_message("assistant"):
+                    with st.spinner("Thinking..."):
+                        data = {
+                            "user_id": st.session_state.user_id,
+                            "question": question,
+                            "use_public_data": use_public_data
+                        }
+                        response = api_call("/chat/ask", method="POST", data=data)
+                        
+                        if response and not response.get("error"):
+                            answer = response.get("answer", "No response")
+                            st.write(answer)
+                            
+                            # Store all response data including chunks
+                            chat_data = {
+                                "role": "assistant",
+                                "content": answer,
+                                "chunks_used": response.get("chunks_used", 0),
+                                "chunks": response.get("chunks", []),
+                                "sources": response.get("sources", []),
+                                "chat_id": response.get("chat_id")
+                            }
+                            
+                            # Add to chat history
+                            st.session_state.chat_history.append(chat_data)
+                            
+                            # Show budget info
+                            budget = response.get("budget_status", {})
+                            st.sidebar.info(f"💰 Budget used: ${budget.get('used_budget', 0):.4f}")
+                            
+                            # Force a rerun to update the UI with the new message
+                            st.rerun()
+                        else:
+                            st.error("Failed to get response")
+                            # Clear the last processed question if there was an error
+                            st.session_state.last_processed_question = None
 
 # Documents Page with working delete button
 def documents_page():
@@ -233,7 +406,7 @@ def documents_page():
     with col1:
         # Show PDF count with user's limit
         response = api_call(f"/pdf/user/{st.session_state.user_id}/count")
-        if response:
+        if response and not response.get("error"):
             count = response.get("pdf_count", 0)
             max_allowed = response.get("max_allowed", 5)
             can_upload = response.get("can_upload_more", True)
@@ -251,7 +424,7 @@ def documents_page():
         # List documents
         response = api_call(f"/pdf/user/{st.session_state.user_id}/documents")
         
-        if response:
+        if response and not response.get("error"):
             documents = response.get("documents", [])
             total_docs = response.get("total_documents", 0)
             max_allowed = response.get("max_allowed", 5)
@@ -268,7 +441,7 @@ def documents_page():
                         with col_a:
                             if st.button("📥 Download", key=f"dl_{doc['document_id']}"):
                                 download_response = api_call(f"/pdf/download/{doc['document_id']}")
-                                if download_response:
+                                if download_response and not download_response.get("error"):
                                     st.success(f"Download initiated for {doc['filename']}")
                                     st.info("In a production app, this would trigger a file download")
                         with col_b:
@@ -280,7 +453,7 @@ def documents_page():
                                     if st.button(f"🗑️ Yes, Delete", key=f"confirm_del_{doc['document_id']}"):
                                         with st.spinner(f"Deleting {doc['filename']}..."):
                                             result = api_call(f"/pdf/delete/{doc['document_id']}", method="DELETE")
-                                            if result:
+                                            if result and not result.get("error"):
                                                 st.success(f"✅ Deleted '{doc['filename']}'!")
                                                 st.session_state.confirm_delete = None
                                                 time.sleep(1)
@@ -305,7 +478,7 @@ def documents_page():
         can_upload = True
         max_allowed = "unlimited"
         
-        if can_upload_response:
+        if can_upload_response and not can_upload_response.get("error"):
             can_upload = can_upload_response.get("can_upload_more", True)
             max_allowed = can_upload_response.get("max_allowed", 5)
         
@@ -341,14 +514,13 @@ def documents_page():
                             data=data
                         )
                         
-                        if response:
+                        if response and not response.get("error"):
                             st.success("✅ Uploaded successfully!")
                             if response.get('is_public'):
                                 st.info("📢 Document is PUBLIC (visible to all users)")
                             else:
                                 st.info("🔒 Document is PRIVATE (only you can access)")
                             
-                                     
                             st.balloons()
                             time.sleep(1)
                             st.rerun()
@@ -367,7 +539,7 @@ def admin_page():
         with col1:
             if st.button("👥 List All Users", key="list_users_btn"):
                 response = api_call("/auth/admin/users")
-                if response:
+                if response and not response.get("error"):
                     users = response.get("users", [])
                     
                     st.write(f"**Total Users:** {len(users)}")
@@ -431,13 +603,13 @@ def admin_page():
                             "max_documents": max_documents
                         }
                         response = api_call("/auth/admin/create-user", method="POST", data=data)
-                        if response:
+                        if response and not response.get("error"):
                             st.success(f"✅ User {username} created successfully!")
                             st.info(f"**Temporary Password:** `{temp_password}`")
                             st.info(f"**Document Limit:** {'Unlimited' if max_documents in [0, -1] else max_documents}")
                             st.warning("⚠️ Give this temporary password to the user!")
                         else:
-                            st.error("Failed to create user")
+                            st.error(f"Failed to create user: {response.get('detail', {}).get('detail', 'Unknown error') if response else 'Unknown error'}")
     
     with tab2:
         st.subheader("Document Management")
@@ -467,7 +639,7 @@ def admin_page():
                             data=data
                         )
                         
-                        if response:
+                        if response and not response.get("error"):
                             st.success("✅ Uploaded successfully!")
                             if response.get('is_public'):
                                 st.info("📢 Document is PUBLIC (visible to all users)")
@@ -480,11 +652,11 @@ def admin_page():
                                 st.info(f"📝 Chunk size: {chunk_settings.get('chunk_size', 300)} characters")
                                 st.info(f"📝 Chunk overlap: {chunk_settings.get('chunk_overlap', 30)} characters")
                         else:
-                            st.error("Upload failed!")
+                            st.error(f"Upload failed: {response.get('detail', {}).get('detail', 'Unknown error') if response else 'Unknown error'}")
         
         if st.button("📋 List All Documents", key="list_all_docs"):
             response = api_call("/pdf/admin/all-documents")
-            if response:
+            if response and not response.get("error"):
                 documents = response.get("documents", [])
                 
                 st.write(f"**Total Documents:** {len(documents)}")
@@ -512,7 +684,7 @@ def admin_page():
                         if st.button(f"🗑️ Yes, Delete", key="admin_confirm_delete_btn"):
                             with st.spinner(f"Deleting {st.session_state['admin_delete_filename']}..."):
                                 result = api_call(f"/pdf/delete/{st.session_state['admin_confirm_delete']}", method="DELETE")
-                                if result:
+                                if result and not result.get("error"):
                                     st.success(f"✅ Deleted '{st.session_state['admin_delete_filename']}'!")
                                     del st.session_state['admin_confirm_delete']
                                     del st.session_state['admin_delete_filename']
@@ -529,13 +701,13 @@ def admin_page():
         
         if st.button("🩺 Check Health", key="health_check"):
             health = api_call("/health")
-            if health:
+            if health and not health.get("error"):
                 st.success("✅ System is healthy")
                 st.json(health)
         
         st.subheader("💰 Budget Status")
         budget = api_call("/chat/budget")
-        if budget:
+        if budget and not budget.get("error"):
             st.json(budget)
         
         # Clear all chat history button
@@ -552,7 +724,7 @@ def admin_page():
         # Show pending registrations
         if st.button("⏳ Show Pending Registrations", key="show_pending"):
             response = api_call("/auth/admin/pending-registrations")
-            if response:
+            if response and not response.get("error"):
                 pending = response.get("pending_registrations", [])
                 count = response.get("count", 0)
                 
@@ -592,7 +764,7 @@ def admin_page():
                     }
                     response = api_call(f"/auth/admin/renew-password/{st.session_state['renew_user_id']}", 
                                       method="POST", data=data)
-                    if response:
+                    if response and not response.get("error"):
                         st.success("✅ Password renewed successfully!")
                         st.info(f"**New Temporary Password:** `{new_temp_password}`")
                         st.warning("⚠️ Give this new temporary password to the user!")
@@ -614,7 +786,7 @@ def admin_page():
             if st.form_submit_button("Check Status"):
                 if check_username:
                     response = api_call(f"/auth/check-registration/{check_username}")
-                    if response:
+                    if response and not response.get("error"):
                         status = response.get('status', 'unknown')
                         if status == 'completed':
                             st.success(f"✅ Registration completed")
@@ -645,7 +817,7 @@ def main():
         initial_sidebar_state="expanded"
     )
     
-    # Custom CSS
+    # Custom CSS with chunk display styles
     st.markdown("""
         <style>
         .main-header {
@@ -704,6 +876,110 @@ def main():
             border-radius: 0.5rem;
             margin: 1rem 0;
         }
+        .already-registered {
+            background-color: #cce5ff;
+            border-color: #b8daff;
+            color: #004085;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            margin: 1rem 0;
+        }
+        
+        /* Chunk display styles */
+        .chunk-box {
+            background-color: #f8f9fa;
+            border-left: 4px solid #007bff;
+            padding: 1rem;
+            margin: 0.5rem 0;
+            border-radius: 0.25rem;
+        }
+        
+        .chunk-header {
+            font-weight: bold;
+            color: #0056b3;
+            margin-bottom: 0.5rem;
+        }
+        
+        .chunk-content {
+            background-color: white;
+            padding: 0.75rem;
+            border-radius: 0.25rem;
+            border: 1px solid #dee2e6;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9rem;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        
+        .chunk-source {
+            font-size: 0.8rem;
+            color: #6c757d;
+            margin-top: 0.5rem;
+            padding-top: 0.5rem;
+            border-top: 1px dashed #dee2e6;
+        }
+        
+        .similarity-badge {
+            background-color: #28a745;
+            color: white;
+            padding: 0.2rem 0.5rem;
+            border-radius: 0.25rem;
+            font-size: 0.8rem;
+            float: right;
+        }
+        
+        .chunk-preview {
+            font-family: 'Courier New', monospace;
+            background-color: #f5f5f5;
+            padding: 0.5rem;
+            border-radius: 0.25rem;
+            font-size: 0.85rem;
+            margin: 0.5rem 0;
+            border: 1px solid #e0e0e0;
+        }
+        
+        .chunk-full-content {
+            font-family: 'Courier New', monospace;
+            background-color: #f8f9fa;
+            padding: 1rem;
+            border-radius: 0.25rem;
+            font-size: 0.9rem;
+            margin: 0.5rem 0;
+            border: 1px solid #dee2e6;
+            max-height: 400px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        
+        /* Chat message styling */
+        .chat-message-user {
+            background-color: #e3f2fd;
+            border-radius: 10px;
+            padding: 10px;
+            margin: 5px 0;
+        }
+        
+        .chat-message-assistant {
+            background-color: #f1f8e9;
+            border-radius: 10px;
+            padding: 10px;
+            margin: 5px 0;
+        }
+        
+        .chunk-toggle-button {
+            background-color: #6c757d;
+            color: white;
+            border: none;
+            padding: 5px 10px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 0.9rem;
+        }
+        
+        .chunk-toggle-button:hover {
+            background-color: #5a6268;
+        }
         </style>
     """, unsafe_allow_html=True)
     
@@ -729,13 +1005,20 @@ def main():
         # Get current PDF count for sidebar
         if st.session_state.user_id:
             response = api_call(f"/pdf/user/{st.session_state.user_id}/count")
-            if response:
+            if response and not response.get("error"):
                 count = response.get("pdf_count", 0)
                 max_allowed = response.get("max_allowed", 5)
                 if max_allowed == "unlimited":
                     st.sidebar.write(f"📁 PDFs: **{count}** (Unlimited)")
                 else:
                     st.sidebar.write(f"📁 PDFs: **{count}/{max_allowed}**")
+        
+        # Show chunk settings in sidebar
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("⚙️ RAG Settings")
+        st.sidebar.info("Chunk size: **300** characters")
+        st.sidebar.info("Chunk overlap: **30** characters")
+        st.sidebar.info("Top chunks per query: **5**")
         
         if st.session_state.is_admin:
             menu = ["💬 Chat", "📁 Documents", "👑 Admin", "🚪 Logout"]
@@ -753,16 +1036,10 @@ def main():
         
         if st.sidebar.button("🔌 Test Connection", key="test_conn"):
             health = api_call("/health")
-            if health:
+            if health and not health.get("error"):
                 st.sidebar.success("✅ Connected to backend")
             else:
                 st.sidebar.error("❌ Cannot connect to backend")
-        
-        # Show chunk settings in sidebar
-        st.sidebar.markdown("---")
-        st.sidebar.subheader("⚙️ Settings")
-        st.sidebar.info("Chunk size: **300** characters")
-        st.sidebar.info("Chunk overlap: **30** characters")
         
         # Main content based on menu choice
         if choice == "💬 Chat":
@@ -782,8 +1059,12 @@ def main():
                 st.session_state.username = None
                 st.session_state.is_admin = False
                 st.session_state.chat_history = []
+                st.session_state.expanded_chunks = {}
+                st.session_state.expanded_full_chunks = {}
                 st.session_state.confirm_delete = None
                 st.session_state.user_max_documents = 5
+                st.session_state.processing_question = None
+                st.session_state.last_processed_question = None
                 st.success("Logged out successfully!")
                 time.sleep(1)
                 st.rerun()
