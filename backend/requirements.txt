@@ -26,16 +26,11 @@ langchain-core
 langchain-community
 langchain-text-splitters
 
-# Pydantic
-<<<<<<< HEAD
-pydantic==2.5.0
-pydantic-settings==2.1.0
-
 locust
-=======
+
 pydantic
 pydantic-settings
 
 bcrypt
 pypdf
->>>>>>> 036c1403bf43a6fbd62129de15a9bbf6877506da
+
