@@ -1,7 +1,7 @@
-# auth.py - Fixed timezone-aware datetime comparisons with JWT Authentication
-from fastapi import APIRouter, HTTPException, Depends
+# auth.py - COMPLETE JWT AUTHENTICATION VERSION
+from fastapi import APIRouter, HTTPException, Depends, status
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Dict, Any
 import bcrypt
 import psycopg2
 from database import get_db_connection
@@ -10,16 +10,14 @@ from datetime import datetime, timedelta, timezone
 import json
 from email_validator import validate_email, EmailNotValidError
 
-# Import security module
+# Import JWT security functions
 from security import (
     create_tokens, 
-    verify_password, 
-    hash_password, 
-    get_current_user,
-    get_current_active_user,
-    require_admin,
-    refresh_access_token,
-    TokenData
+    verify_token, 
+    get_current_user, 
+    TokenData,
+    hash_password as security_hash_password,
+    refresh_access_token as security_refresh_access_token
 )
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
@@ -29,9 +27,9 @@ class AdminCreateUser(BaseModel):
     username: str
     email: str
     temporary_password: str
-    password_expires: bool = False
+    password_expires: bool = False  # False = permanent, True = expires in 1 day
     is_admin: bool = False
-    max_documents: int = 5
+    max_documents: int = 5  # Default to 5 documents
 
 class UserCompleteRegistration(BaseModel):
     username: str
@@ -46,16 +44,29 @@ class UserChangePassword(BaseModel):
     current_password: str
     new_password: str
 
-class RefreshTokenRequest(BaseModel):
+class TokenRefresh(BaseModel):
     refresh_token: str
 
-# Helper function to get current UTC time
+# Helper function to hash passwords
+def hash_password(password: str) -> str:
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
+    return hashed.decode('utf-8')
+
+# Helper function to verify passwords
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+    except:
+        return False
+
+# Get current UTC time with timezone
 def get_current_utc_time():
     return datetime.now(timezone.utc)
 
-# Public endpoint - Admin creates a user registration
+# Admin endpoint to create a user registration
 @router.post("/admin/create-user")
-def admin_create_user(user_data: AdminCreateUser, current_user: TokenData = Depends(require_admin)):
+def admin_create_user(user_data: AdminCreateUser):
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -80,7 +91,7 @@ def admin_create_user(user_data: AdminCreateUser, current_user: TokenData = Depe
         # 4. Hash the temporary password
         temp_password_hash = hash_password(user_data.temporary_password)
         
-        # 5. Calculate expiration time
+        # 5. Calculate expiration time (using timezone-aware datetime)
         registration_expires_at = None
         if user_data.password_expires:
             registration_expires_at = get_current_utc_time() + timedelta(days=1)
@@ -92,7 +103,7 @@ def admin_create_user(user_data: AdminCreateUser, current_user: TokenData = Depe
         if user_data.is_admin:
             user_data.max_documents = -1
         
-        # 6. Insert the new user
+        # 6. Insert the new user with temporary registration data
         cursor.execute("""
             INSERT INTO users (
                 user_id, username, email, 
@@ -130,6 +141,7 @@ def admin_create_user(user_data: AdminCreateUser, current_user: TokenData = Depe
             "email": email,
             "is_admin": user_data.is_admin,
             "max_documents": user_data.max_documents,
+            "temporary_password": user_data.temporary_password,
             "expires": registration_expires_at.isoformat() if registration_expires_at else "Never",
             "expires_in": "1 day" if registration_expires_at else "Never",
             "instructions": "Give this temporary password to the user to complete registration"
@@ -147,7 +159,7 @@ def admin_create_user(user_data: AdminCreateUser, current_user: TokenData = Depe
         cursor.close()
         conn.close()
 
-# Public endpoint - User completes registration
+# User endpoint to complete registration with temporary password
 @router.post("/complete-registration")
 def complete_registration(user_data: UserCompleteRegistration):
     conn = get_db_connection()
@@ -171,7 +183,7 @@ def complete_registration(user_data: UserCompleteRegistration):
         if reg_used:
             raise HTTPException(status_code=400, detail="Registration already completed")
         
-        # 3. Check if registration is expired
+        # 3. Check if registration is expired (using timezone-aware comparison)
         current_time = get_current_utc_time()
         if reg_expires_at and current_time > reg_expires_at:
             details = json.dumps({"reason": "registration_expired"})
@@ -184,6 +196,7 @@ def complete_registration(user_data: UserCompleteRegistration):
         
         # 4. Verify the temporary password
         if not verify_password(user_data.registration_password, reg_password_hash):
+            # Log failed attempt
             details = json.dumps({"reason": "wrong_temporary_password"})
             cursor.execute("""
                 INSERT INTO activity_log (user_id, activity_type, details)
@@ -195,7 +208,7 @@ def complete_registration(user_data: UserCompleteRegistration):
         # 5. Hash the new password
         new_password_hash = hash_password(user_data.new_password)
         
-        # 6. Update user with new password
+        # 6. Update user with new password and mark registration as used
         cursor.execute("""
             UPDATE users 
             SET password_hash = %s, 
@@ -233,7 +246,7 @@ def complete_registration(user_data: UserCompleteRegistration):
         cursor.close()
         conn.close()
 
-# Public endpoint - User login with JWT tokens
+# User Login Endpoint WITH JWT TOKENS
 @router.post("/login")
 def login(user_data: UserLogin):
     conn = get_db_connection()
@@ -242,7 +255,7 @@ def login(user_data: UserLogin):
     try:
         # 1. Fetch user by username including registration status
         cursor.execute("""
-            SELECT user_id, password_hash, is_admin, registration_used, email
+            SELECT user_id, password_hash, is_admin, registration_used, email, username
             FROM users WHERE username = %s
         """, (user_data.username,))
         
@@ -250,14 +263,16 @@ def login(user_data: UserLogin):
         if not user:
             raise HTTPException(status_code=401, detail="Invalid username or password")
         
-        user_id, stored_hash, is_admin, reg_used, email = user
+        user_id, stored_hash, is_admin, reg_used, email, db_username = user
         
         # 2. Check if user has completed registration
         if not reg_used:
+            # Check if registration is expired
             cursor.execute("""
                 SELECT registration_expires_at FROM users WHERE user_id = %s
             """, (user_id,))
-            expires_at = cursor.fetchone()[0]
+            result = cursor.fetchone()
+            expires_at = result[0] if result else None
             
             current_time = get_current_utc_time()
             if expires_at and current_time > expires_at:
@@ -273,6 +288,7 @@ def login(user_data: UserLogin):
         
         # 3. Verify the provided password
         if not verify_password(user_data.password, stored_hash):
+            # Log failed attempt
             details = json.dumps({"reason": "wrong_password"})
             cursor.execute("""
                 INSERT INTO activity_log (user_id, activity_type, details)
@@ -282,7 +298,7 @@ def login(user_data: UserLogin):
             raise HTTPException(status_code=401, detail="Invalid username or password")
         
         # 4. Create JWT tokens
-        tokens = create_tokens(user_id, user_data.username, is_admin)
+        tokens = create_tokens(user_id=user_id, username=db_username, is_admin=is_admin)
         
         # 5. Log successful login
         details = json.dumps({"is_admin": is_admin, "email": email})
@@ -293,14 +309,16 @@ def login(user_data: UserLogin):
         
         conn.commit()
         
-        # Return tokens and user info
+        # Return user info WITH JWT TOKENS
         return {
             "message": "Login successful", 
             "user_id": user_id, 
-            "username": user_data.username,
+            "username": db_username,
             "email": email,
             "is_admin": is_admin,
-            **tokens
+            "access_token": tokens["access_token"],
+            "refresh_token": tokens["refresh_token"],
+            "token_type": "bearer"
         }
         
     except psycopg2.Error as e:
@@ -315,42 +333,45 @@ def login(user_data: UserLogin):
         cursor.close()
         conn.close()
 
-# Public endpoint - Refresh access token
+# Token refresh endpoint
 @router.post("/refresh")
-def refresh_token(request: RefreshTokenRequest):
+def refresh_token(token_data: TokenRefresh):
     """Refresh access token using refresh token"""
     try:
-        tokens = refresh_access_token(request.refresh_token)
-        return tokens
+        result = security_refresh_access_token(token_data.refresh_token)
+        return result
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Token refresh error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Token refresh failed: {str(e)}"
+        )
 
-# Protected endpoint - Get current user info
+# Get current user info (requires authentication)
 @router.get("/me")
-def get_current_user_info(current_user: TokenData = Depends(get_current_active_user)):
-    """Get information about the currently authenticated user"""
+def get_current_user_info(current_user: TokenData = Depends(get_current_user)):
+    """Get current user info from JWT token"""
     conn = get_db_connection()
     cursor = conn.cursor()
     
     try:
         cursor.execute("""
-            SELECT username, email, is_admin, max_documents, created_at
-            FROM users WHERE user_id = %s
+            SELECT email, created_at, max_documents FROM users 
+            WHERE user_id = %s
         """, (current_user.user_id,))
         
         user = cursor.fetchone()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         
-        username, email, is_admin, max_documents, created_at = user
+        email, created_at, max_documents = user
         
         return {
             "user_id": current_user.user_id,
-            "username": username,
+            "username": current_user.username,
             "email": email,
-            "is_admin": is_admin,
+            "is_admin": current_user.is_admin,
             "max_documents": max_documents,
             "created_at": created_at.isoformat() if created_at else None
         }
@@ -359,65 +380,7 @@ def get_current_user_info(current_user: TokenData = Depends(get_current_active_u
         cursor.close()
         conn.close()
 
-# Protected endpoint - Change password
-@router.post("/change-password")
-def change_password(
-    user_data: UserChangePassword,
-    current_user: TokenData = Depends(get_current_active_user)
-):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    try:
-        # 1. Get current password hash
-        cursor.execute("""
-            SELECT password_hash FROM users WHERE user_id = %s
-        """, (current_user.user_id,))
-        
-        result = cursor.fetchone()
-        if not result:
-            raise HTTPException(status_code=404, detail="User not found")
-        
-        current_hash = result[0]
-        
-        # 2. Verify current password
-        if not verify_password(user_data.current_password, current_hash):
-            raise HTTPException(status_code=401, detail="Current password is incorrect")
-        
-        # 3. Hash new password
-        new_password_hash = hash_password(user_data.new_password)
-        
-        # 4. Update password
-        cursor.execute("""
-            UPDATE users 
-            SET password_hash = %s
-            WHERE user_id = %s
-        """, (new_password_hash, current_user.user_id))
-        
-        # 5. Log password change
-        details = json.dumps({"action": "password_change"})
-        cursor.execute("""
-            INSERT INTO activity_log (user_id, activity_type, details)
-            VALUES (%s, %s, %s)
-        """, (current_user.user_id, 'PASSWORD_CHANGE', details))
-        
-        conn.commit()
-        
-        return {"message": "Password changed successfully"}
-        
-    except psycopg2.Error as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {e}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
-    finally:
-        cursor.close()
-        conn.close()
-
-# Public endpoint - Check registration status
+# Endpoint to check registration status
 @router.get("/check-registration/{username}")
 def check_registration(username: str):
     conn = get_db_connection()
@@ -438,6 +401,7 @@ def check_registration(username: str):
         (user_id, username, email, reg_used, reg_expires_at, 
          reg_created_at, is_admin, max_documents) = user
         
+        # Check if registration is expired (using timezone-aware comparison)
         current_time = get_current_utc_time()
         is_expired = False
         expires_in = None
@@ -471,18 +435,14 @@ def check_registration(username: str):
         cursor.close()
         conn.close()
 
-# Admin-only endpoint - Renew password
+# Admin endpoint to resend/renew temporary password
 @router.post("/admin/renew-password/{user_id}")
-def admin_renew_password(
-    user_id: str, 
-    temporary_password: str, 
-    password_expires: bool = False,
-    current_user: TokenData = Depends(require_admin)
-):
+def admin_renew_password(user_id: str, temporary_password: str, password_expires: bool = False):
     conn = get_db_connection()
     cursor = conn.cursor()
     
     try:
+        # Check if user exists
         cursor.execute("SELECT username, email FROM users WHERE user_id = %s", (user_id,))
         user = cursor.fetchone()
         if not user:
@@ -490,14 +450,17 @@ def admin_renew_password(
         
         username, email = user
         
+        # Hash the new temporary password
         temp_password_hash = hash_password(temporary_password)
         
+        # Calculate expiration time (using timezone-aware datetime)
         registration_expires_at = None
         if password_expires:
             registration_expires_at = get_current_utc_time() + timedelta(days=1)
         
         current_time = get_current_utc_time()
         
+        # Update user with new temporary password
         cursor.execute("""
             UPDATE users 
             SET registration_password_hash = %s,
@@ -508,6 +471,7 @@ def admin_renew_password(
             WHERE user_id = %s
         """, (temp_password_hash, registration_expires_at, current_time, user_id))
         
+        # Log the activity
         details = json.dumps({
             "username": username,
             "email": email,
@@ -527,6 +491,7 @@ def admin_renew_password(
             "user_id": user_id,
             "username": username,
             "email": email,
+            "temporary_password": temporary_password,
             "expires": registration_expires_at.isoformat() if registration_expires_at else "Never",
             "expires_in": "1 day" if registration_expires_at else "Never",
             "instructions": "Give this new temporary password to the user"
@@ -544,9 +509,13 @@ def admin_renew_password(
         cursor.close()
         conn.close()
 
-# Admin-only endpoint - List pending registrations
+# Admin-only endpoint to list pending registrations
 @router.get("/admin/pending-registrations")
-def list_pending_registrations(current_user: TokenData = Depends(require_admin)):
+def list_pending_registrations(current_user: TokenData = Depends(get_current_user)):
+    """List all pending registrations (admin only)"""
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -567,6 +536,7 @@ def list_pending_registrations(current_user: TokenData = Depends(require_admin))
         for user in pending_users:
             user_id, username, email, reg_created, reg_expires, is_admin, max_documents = user
             
+            # Check if expired (using timezone-aware comparison)
             is_expired = False
             expires_in = None
             if reg_expires:
@@ -600,9 +570,13 @@ def list_pending_registrations(current_user: TokenData = Depends(require_admin))
         cursor.close()
         conn.close()
 
-# Admin-only endpoint - List all users
+# Admin-only endpoint to list all users with registration status
 @router.get("/admin/users")
-def list_all_users(current_user: TokenData = Depends(require_admin)):
+def list_all_users(current_user: TokenData = Depends(get_current_user)):
+    """List all users (admin only)"""
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -626,6 +600,7 @@ def list_all_users(current_user: TokenData = Depends(require_admin)):
             (user_id, username, email, is_admin, reg_used, reg_created, 
              reg_expires, created_at, max_documents, doc_count) = user
             
+            # Determine registration status (using timezone-aware comparison)
             status = "active"
             if not reg_used:
                 if reg_expires and current_time > reg_expires:
@@ -657,7 +632,7 @@ def list_all_users(current_user: TokenData = Depends(require_admin)):
         cursor.close()
         conn.close()
 
-# Public endpoint - Old registration endpoint (kept for backward compatibility)
+# Old registration endpoint (kept for backward compatibility)
 @router.post("/register")
 def old_register():
     raise HTTPException(
@@ -665,7 +640,63 @@ def old_register():
         detail="Self-registration is disabled. Please contact admin for account creation."
     )
 
-# Simple health check - Public
+# User change password endpoint
+@router.post("/change-password")
+def change_password(
+    user_data: UserChangePassword,
+    current_user: TokenData = Depends(get_current_user)
+):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # Get user's current password hash
+        cursor.execute("""
+            SELECT password_hash FROM users WHERE user_id = %s
+        """, (current_user.user_id,))
+        
+        result = cursor.fetchone()
+        if not result or not result[0]:
+            raise HTTPException(status_code=400, detail="User not found or password not set")
+        
+        current_password_hash = result[0]
+        
+        # Verify current password
+        if not verify_password(user_data.current_password, current_password_hash):
+            raise HTTPException(status_code=401, detail="Current password is incorrect")
+        
+        # Hash new password
+        new_password_hash = hash_password(user_data.new_password)
+        
+        # Update password
+        cursor.execute("""
+            UPDATE users SET password_hash = %s WHERE user_id = %s
+        """, (new_password_hash, current_user.user_id))
+        
+        # Log the activity
+        details = json.dumps({"password_changed": True})
+        cursor.execute("""
+            INSERT INTO activity_log (user_id, activity_type, details)
+            VALUES (%s, %s, %s)
+        """, (current_user.user_id, 'PASSWORD_CHANGED', details))
+        
+        conn.commit()
+        
+        return {"message": "Password changed successfully"}
+        
+    except psycopg2.Error as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+# Simple health check
 @router.get("/status")
 def auth_status():
-    return {"status": "auth module is working"}
+    return {"status": "auth module is working", "jwt_enabled": True}

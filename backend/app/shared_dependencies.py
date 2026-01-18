@@ -1,4 +1,4 @@
-# shared_dependencies.py
+# shared_dependencies.py - UPDATED with conversation chunking
 from openai import AzureOpenAI
 import os
 import httpx

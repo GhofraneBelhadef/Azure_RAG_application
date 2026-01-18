@@ -1,4 +1,4 @@
-# frontend/app_simple.py - Complete with JWT Authentication
+# frontend/app_simple.py - Complete with working delete functionality
 import streamlit as st
 import requests
 import json
@@ -44,6 +44,12 @@ def init_session_state():
         st.session_state.refresh_token = None
     if 'token_expiry' not in st.session_state:
         st.session_state.token_expiry = None
+    if 'documents_cache' not in st.session_state:
+        st.session_state.documents_cache = None
+    if 'cache_timestamp' not in st.session_state:
+        st.session_state.cache_timestamp = None
+    if 'admin_confirm_delete' not in st.session_state:
+        st.session_state.admin_confirm_delete = None
 
 init_session_state()
 
@@ -90,7 +96,10 @@ def api_call(endpoint, method="GET", data=None, files=None, require_auth=True):
         
         # Handle response
         if response.status_code == 200:
-            return response.json()
+            try:
+                return response.json()
+            except:
+                return {"success": True, "message": "Operation completed successfully"}
         elif response.status_code == 401 and require_auth:
             # Token might be expired, try to refresh
             refresh_response = refresh_token_call()
@@ -109,7 +118,10 @@ def api_call(endpoint, method="GET", data=None, files=None, require_auth=True):
                     response = requests.delete(url, headers=headers)
                 
                 if response.status_code == 200:
-                    return response.json()
+                    try:
+                        return response.json()
+                    except:
+                        return {"success": True, "message": "Operation completed successfully"}
         
         # Return error response
         error_detail = {"detail": f"HTTP {response.status_code}"}
@@ -161,6 +173,11 @@ def refresh_token_call():
             "detail": {"detail": f"Refresh failed: {str(e)}"}
         }
 
+def clear_documents_cache():
+    """Clear documents cache"""
+    st.session_state.documents_cache = None
+    st.session_state.cache_timestamp = None
+
 # Login Page
 def login_page():
     st.title("🔐 Azure RAG Chatbot Login")
@@ -200,6 +217,9 @@ def login_page():
                     reg_response = api_call(f"/auth/check-registration/{username}", require_auth=False)
                     if reg_response and not reg_response.get("error"):
                         st.session_state.user_max_documents = reg_response.get("max_documents", 5)
+                    
+                    # Clear cache on login
+                    clear_documents_cache()
                     
                     st.success(f"Welcome {username}! ({'Admin' if st.session_state.is_admin else 'User'})")
                     time.sleep(1)
@@ -309,6 +329,7 @@ def chat_page():
             st.session_state.access_token = None
             st.session_state.refresh_token = None
             st.session_state.token_expiry = None
+            clear_documents_cache()
             st.rerun()
         
         # Health check
@@ -474,10 +495,6 @@ def chat_page():
                             # Add to chat history
                             st.session_state.chat_history.append(chat_data)
                             
-                            # Show budget info
-                            budget = response.get("budget_status", {})
-                            st.sidebar.info(f"💰 Budget used: ${budget.get('used_budget', 0):.4f}")
-                            
                             # Force a rerun to update the UI with the new message
                             st.rerun()
                         else:
@@ -489,9 +506,36 @@ def chat_page():
 def documents_page():
     st.title("📁 My Documents")
     
-    # Clear delete confirmation if we're just viewing
-    if st.session_state.confirm_delete and not st.button("Cancel Delete", key="cancel_delete"):
-        st.session_state.confirm_delete = None
+    # Refresh button
+    if st.button("🔄 Refresh Documents"):
+        clear_documents_cache()
+        st.success("Documents refreshed!")
+        time.sleep(0.5)
+        st.rerun()
+    
+    # Clear delete confirmation
+    if st.session_state.confirm_delete:
+        st.warning(f"⚠️ Are you SURE you want to delete this document?")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🗑️ Yes, Delete", key="final_confirm_delete"):
+                with st.spinner("Deleting document..."):
+                    # Call the delete API
+                    result = api_call(f"/pdf/delete/{st.session_state.confirm_delete}", method="DELETE", require_auth=True)
+                    if result and not result.get("error"):
+                        st.success("✅ Document deleted successfully!")
+                        # Clear cache and confirmation
+                        clear_documents_cache()
+                        st.session_state.confirm_delete = None
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        error_msg = result.get('detail', {}).get('detail', 'Unknown error') if result else 'Unknown error'
+                        st.error(f"Failed to delete: {error_msg}")
+        with col2:
+            if st.button("❌ Cancel", key="cancel_final_delete"):
+                st.session_state.confirm_delete = None
+                st.rerun()
     
     col1, col2 = st.columns([3, 1])
     
@@ -513,53 +557,35 @@ def documents_page():
                 st.warning(f"📊 You have {count}/{max_allowed} PDFs (LIMIT REACHED)")
                 st.caption(f"Your document limit: {user_max_docs}")
         
-        # List documents
-        response = api_call("/pdf/user/documents", require_auth=True)
-        
-        if response and not response.get("error"):
-            documents = response.get("documents", [])
-            total_docs = response.get("total_documents", 0)
-            max_allowed = response.get("max_allowed", 5)
-            
-            if documents:
-                for doc in documents:
-                    with st.expander(f"📄 {doc['filename']}", expanded=False):
-                        st.write(f"**ID:** `{doc['document_id']}`")
-                        st.write(f"**Uploaded:** {doc['uploaded_at']}")
-                        st.write(f"**Chunks:** {doc.get('chunk_count', 0)}")
-                        st.write(f"**Visibility:** {'Public' if doc['is_public'] else 'Private (only you)'}")
-                        
-                        col_a, col_b = st.columns(2)
-                        with col_a:
-                            if st.button("📥 Download", key=f"dl_{doc['document_id']}"):
-                                download_response = api_call(f"/pdf/download/{doc['document_id']}", require_auth=True)
-                                if download_response and not download_response.get("error"):
-                                    st.success(f"Download initiated for {doc['filename']}")
-                                    st.info("In a production app, this would trigger a file download")
-                        with col_b:
-                            # Check if this is the document we're confirming to delete
-                            if st.session_state.confirm_delete == doc['document_id']:
-                                st.warning(f"⚠️ Are you SURE you want to delete '{doc['filename']}'?")
-                                confirm_col1, confirm_col2 = st.columns(2)
-                                with confirm_col1:
-                                    if st.button(f"🗑️ Yes, Delete", key=f"confirm_del_{doc['document_id']}"):
-                                        with st.spinner(f"Deleting {doc['filename']}..."):
-                                            result = api_call(f"/pdf/delete/{doc['document_id']}", method="DELETE", require_auth=True)
-                                            if result and not result.get("error"):
-                                                st.success(f"✅ Deleted '{doc['filename']}'!")
-                                                st.session_state.confirm_delete = None
-                                                time.sleep(1)
-                                                st.rerun()
-                                with confirm_col2:
-                                    if st.button("❌ Cancel", key=f"cancel_del_{doc['document_id']}"):
-                                        st.session_state.confirm_delete = None
-                                        st.rerun()
-                            else:
-                                if st.button("🗑️ Delete", key=f"del_{doc['document_id']}"):
-                                    st.session_state.confirm_delete = doc['document_id']
-                                    st.rerun()
+        # List documents - use cache if available
+        if st.session_state.documents_cache:
+            documents = st.session_state.documents_cache
+            if st.session_state.cache_timestamp:
+                cache_age = (datetime.now() - st.session_state.cache_timestamp).seconds
+                st.caption(f"📅 Data loaded {cache_age} seconds ago")
+        else:
+            response = api_call("/pdf/user/documents", require_auth=True)
+            if response and not response.get("error"):
+                documents = response.get("documents", [])
+                st.session_state.documents_cache = documents
+                st.session_state.cache_timestamp = datetime.now()
             else:
-                st.info("No documents found. Upload some PDFs!")
+                documents = []
+        
+        if documents:
+            for doc in documents:
+                with st.expander(f"📄 {doc['filename']}", expanded=False):
+                    st.write(f"**ID:** `{doc['document_id']}`")
+                    st.write(f"**Uploaded:** {doc['uploaded_at']}")
+                    st.write(f"**Chunks:** {doc.get('chunk_count', 0)}")
+                    st.write(f"**Visibility:** {'Public' if doc['is_public'] else 'Private (only you)'}")
+                    
+                    # Delete button
+                    if st.button("🗑️ Delete", key=f"delete_{doc['document_id']}"):
+                        st.session_state.confirm_delete = doc['document_id']
+                        st.rerun()
+        else:
+            st.info("No documents found. Upload some PDFs!")
     
     with col2:
         # Upload new document
@@ -614,9 +640,14 @@ def documents_page():
                             else:
                                 st.info("🔒 Document is PRIVATE (only you can access)")
                             
+                            # Clear cache
+                            clear_documents_cache()
                             st.balloons()
                             time.sleep(1)
                             st.rerun()
+                        else:
+                            error_msg = response.get('detail', {}).get('detail', 'Upload failed') if response else 'Upload failed'
+                            st.error(f"Upload failed: {error_msg}")
 
 # Admin Page
 def admin_page():
@@ -707,6 +738,29 @@ def admin_page():
     with tab2:
         st.subheader("Document Management")
         
+        # Clear admin delete confirmation
+        if st.session_state.admin_confirm_delete:
+            doc_id, doc_name = st.session_state.admin_confirm_delete
+            st.warning(f"⚠️ Are you SURE you want to delete '{doc_name}'?")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("🗑️ Yes, Delete", key="admin_final_confirm_delete"):
+                    with st.spinner(f"Deleting {doc_name}..."):
+                        result = api_call(f"/pdf/delete/{doc_id}", method="DELETE", require_auth=True)
+                        if result and not result.get("error"):
+                            st.success(f"✅ Deleted '{doc_name}' successfully!")
+                            # Clear confirmation
+                            st.session_state.admin_confirm_delete = None
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            error_msg = result.get('detail', {}).get('detail', 'Unknown error') if result else 'Unknown error'
+                            st.error(f"Failed to delete: {error_msg}")
+            with col2:
+                if st.button("❌ Cancel", key="admin_cancel_final_delete"):
+                    st.session_state.admin_confirm_delete = None
+                    st.rerun()
+        
         # Admin upload for other users
         st.subheader("Upload PDF for User")
         with st.form("admin_upload_form"):
@@ -763,31 +817,9 @@ def admin_page():
                         st.write(f"**Public:** {'Yes' if doc['is_public'] else 'No'}")
                         st.write(f"**Chunks:** {doc['chunk_count']}")
                         
-                        col_del, _ = st.columns([1, 3])
-                        with col_del:
-                            if st.button("🗑️ Delete", key=f"admin_del_{doc['document_id']}"):
-                                st.session_state['admin_confirm_delete'] = doc['document_id']
-                                st.session_state['admin_delete_filename'] = doc['filename']
-                                st.rerun()
-                
-                # Handle delete confirmation
-                if 'admin_confirm_delete' in st.session_state:
-                    st.warning(f"⚠️ Are you SURE you want to delete '{st.session_state['admin_delete_filename']}'?")
-                    confirm_col1, confirm_col2 = st.columns(2)
-                    with confirm_col1:
-                        if st.button(f"🗑️ Yes, Delete", key="admin_confirm_delete_btn"):
-                            with st.spinner(f"Deleting {st.session_state['admin_delete_filename']}..."):
-                                result = api_call(f"/pdf/delete/{st.session_state['admin_confirm_delete']}", method="DELETE", require_auth=True)
-                                if result and not result.get("error"):
-                                    st.success(f"✅ Deleted '{st.session_state['admin_delete_filename']}'!")
-                                    del st.session_state['admin_confirm_delete']
-                                    del st.session_state['admin_delete_filename']
-                                    time.sleep(1)
-                                    st.rerun()
-                    with confirm_col2:
-                        if st.button("❌ Cancel", key="admin_cancel_delete_btn"):
-                            del st.session_state['admin_confirm_delete']
-                            del st.session_state['admin_delete_filename']
+                        # Delete button for admin
+                        if st.button("🗑️ Delete", key=f"admin_del_{doc['document_id']}"):
+                            st.session_state.admin_confirm_delete = (doc['document_id'], doc['filename'])
                             st.rerun()
     
     with tab3:
@@ -798,11 +830,6 @@ def admin_page():
             if health and not health.get("error"):
                 st.success("✅ System is healthy")
                 st.json(health)
-        
-        st.subheader("💰 Budget Status")
-        budget = api_call("/chat/budget", require_auth=True)
-        if budget and not budget.get("error"):
-            st.json(budget)
         
         # Clear all chat history button
         st.subheader("🔧 Maintenance")
@@ -964,7 +991,7 @@ def main():
         initial_sidebar_state="expanded"
     )
     
-    # Custom CSS with chunk display styles
+    # Custom CSS
     st.markdown("""
         <style>
         .main-header {

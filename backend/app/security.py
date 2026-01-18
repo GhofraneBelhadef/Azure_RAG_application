@@ -1,4 +1,4 @@
-# backend/app/security.py - JWT Authentication & Security
+# backend/app/security.py - FIXED JWT Authentication & Security
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 from jose import JWTError, jwt
@@ -74,10 +74,10 @@ def verify_token(token: str) -> Dict[str, Any]:
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         return payload
-    except JWTError:
+    except JWTError as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials",
+            detail=f"Invalid token: {str(e)}",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -146,7 +146,7 @@ def create_tokens(user_id: str, username: str, is_admin: bool) -> Dict[str, str]
         "token_type": "bearer"
     }
 
-async def refresh_access_token(refresh_token: str) -> Dict[str, str]:
+def refresh_access_token(refresh_token: str) -> Dict[str, str]:
     """Create new access token using refresh token"""
     try:
         payload = jwt.decode(refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -180,10 +180,10 @@ async def refresh_access_token(refresh_token: str) -> Dict[str, str]:
             "token_type": "bearer"
         }
         
-    except JWTError:
+    except JWTError as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid refresh token"
+            detail=f"Invalid refresh token: {str(e)}"
         )
 
 # For backward compatibility with existing code
